@@ -182,12 +182,24 @@ enum UpdateDto {
     ServerChanged { server: String },
     Removed { server: String },
     ServerRemoved { server: String },
-    Voice { server: String, channel: String, peers: Vec<String>, live: Vec<String> },
+    Voice {
+        server: String,
+        channel: String,
+        peers: Vec<String>,
+        live: Vec<String>,
+        camera: Vec<String>,
+        muted: Vec<String>,
+        deafened: Vec<String>,
+    },
     Speaking { server: String, peer: String, speaking: bool },
     Typing { server: String, channel: String, peer: String },
     Friend { peer: String, request: bool },
     Profile { peer: String },
-    KeyframeRequested,
+    KeyframeRequested { camera: bool },
+}
+
+fn strs(peers: &[PeerId]) -> Vec<String> {
+    peers.iter().map(|p| p.to_string()).collect()
 }
 
 fn to_dto(u: Update, me: PeerId) -> UpdateDto {
@@ -209,11 +221,14 @@ fn to_dto(u: Update, me: PeerId) -> UpdateDto {
         }
         Update::Server { server, .. } => UpdateDto::ServerChanged { server: server.to_string() },
         Update::ServerRemoved { server } => UpdateDto::ServerRemoved { server: server.to_string() },
-        Update::Voice { server, channel, peers, live } => UpdateDto::Voice {
+        Update::Voice { server, channel, peers, live, camera, muted, deafened } => UpdateDto::Voice {
             server: server.to_string(),
             channel: eid(&channel),
-            peers: peers.iter().map(|p| p.to_string()).collect(),
-            live: live.iter().map(|p| p.to_string()).collect(),
+            peers: strs(&peers),
+            live: strs(&live),
+            camera: strs(&camera),
+            muted: strs(&muted),
+            deafened: strs(&deafened),
         },
         Update::Speaking { server, peer, speaking } => {
             UpdateDto::Speaking { server: server.to_string(), peer: peer.to_string(), speaking }
@@ -223,7 +238,7 @@ fn to_dto(u: Update, me: PeerId) -> UpdateDto {
         }
         Update::Friend { peer, request } => UpdateDto::Friend { peer: peer.to_string(), request },
         Update::Profile { peer } => UpdateDto::Profile { peer: peer.to_string() },
-        Update::KeyframeRequested => UpdateDto::KeyframeRequested,
+        Update::KeyframeRequested { camera } => UpdateDto::KeyframeRequested { camera },
     }
 }
 
@@ -240,7 +255,7 @@ struct App {
     data_dir: PathBuf,
     audio: Mutex<Option<Audio>>,
     video_out: Mutex<Option<MediaSender>>,
-    /// Where incoming screen-share frames go: `peer id (32 bytes) | payload`.
+    /// Where incoming video goes: `kind (1) | peer id (32) | payload`, kind 2 = screen, 3 = camera.
     video_in: Arc<Mutex<Option<Channel<InvokeResponseBody>>>>,
     /// What we last told peers about our speaking state.
     speaking: Mutex<bool>,
@@ -538,11 +553,12 @@ async fn voice_join(app: State<'_, App>, server: String, channel: String) -> Res
     let sink = app.video_in.clone();
     let opts = AudioOptions {
         on_media: Some(Box::new(move |p| {
-            if p.kind != hearth_core::KIND_VIDEO {
+            if p.kind != hearth_core::KIND_VIDEO && p.kind != hearth_core::KIND_CAMERA {
                 return;
             }
             if let Some(ch) = sink.lock().unwrap().as_ref() {
-                let mut buf = Vec::with_capacity(32 + p.payload.len());
+                let mut buf = Vec::with_capacity(33 + p.payload.len());
+                buf.push(p.kind);
                 buf.extend_from_slice(p.from.as_bytes());
                 buf.extend_from_slice(&p.payload);
                 let _ = ch.send(InvokeResponseBody::Raw(buf));
@@ -572,12 +588,30 @@ async fn voice_leave(app: State<'_, App>) -> Res<()> {
     app.hearth.voice_leave().await.map_err(err)
 }
 
+/// Mutes/deafens our audio and shows it to everyone in the call.
 #[tauri::command]
-fn set_mute(app: State<'_, App>, muted: bool, deafened: bool) {
+async fn set_mute(app: State<'_, App>, muted: bool, deafened: bool) -> Res<()> {
     if let Some(a) = app.audio.lock().unwrap().as_ref() {
         a.controls.muted.store(muted || deafened, std::sync::atomic::Ordering::Relaxed);
         a.controls.deafened.store(deafened, std::sync::atomic::Ordering::Relaxed);
     }
+    app.hearth.set_voice_flags(muted || deafened, deafened).await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_camera(app: State<'_, App>, on: bool) -> Res<()> {
+    app.hearth.set_camera(on).await.map_err(err)
+}
+
+/// One encoded camera frame. Byte 0 bit 0 marks a keyframe.
+#[tauri::command]
+async fn push_camera(app: State<'_, App>, request: Request<'_>) -> Res<usize> {
+    let InvokeBody::Raw(frame) = request.body() else {
+        return Err("expected raw bytes".into());
+    };
+    let keyframe = frame.first().is_some_and(|f| f & 1 == 1);
+    let out = app.video_out.lock().unwrap();
+    Ok(out.as_ref().map_or(0, |s| s.send_camera(frame, keyframe)))
 }
 
 #[derive(Serialize)]
@@ -616,6 +650,9 @@ struct VoiceRoomDto {
     channel: String,
     peers: Vec<String>,
     live: Vec<String>,
+    camera: Vec<String>,
+    muted: Vec<String>,
+    deafened: Vec<String>,
 }
 
 /// Everyone in voice right now, so a freshly opened window starts complete.
@@ -630,8 +667,11 @@ async fn voice_snapshot(app: State<'_, App>) -> Res<Vec<VoiceRoomDto>> {
         .map(|r| VoiceRoomDto {
             server: r.server.to_string(),
             channel: eid(&r.channel),
-            peers: r.peers.iter().map(|p| p.to_string()).collect(),
-            live: r.live.iter().map(|p| p.to_string()).collect(),
+            peers: strs(&r.peers),
+            live: strs(&r.live),
+            camera: strs(&r.camera),
+            muted: strs(&r.muted),
+            deafened: strs(&r.deafened),
         })
         .collect())
 }
@@ -768,6 +808,8 @@ fn main() {
             voice_join,
             voice_leave,
             set_mute,
+            set_camera,
+            push_camera,
             voice_levels,
             voice_snapshot,
             set_live,

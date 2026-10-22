@@ -73,6 +73,7 @@ commands:
   /host <node>             add a storage node    /unhost <node>       remove it
   /voice [channel]         join voice           /leave               leave voice
   /mute  /deafen           toggle mic/sound      /live  /unlive       stream (--video-test)
+  /cam  /nocam             camera (--video-test)
   /watch <peer>            watch a stream        /peers               who's online
   /friend <peer>           add/accept friend     /friends             friends & requests
   /unfriend <peer>         remove/decline        /dm <friend> <text>  direct message
@@ -201,21 +202,27 @@ fn test_frame(n: u32, key: bool) -> Vec<u8> {
 }
 
 fn video_test_receiver() -> Box<dyn Fn(hearth_core::MediaPacket) + Send> {
-    // (frames received, frames that failed verification)
-    let state = std::sync::Mutex::new((0u32, 0u32));
+    // Per kind: (frames received, frames that failed verification)
+    let state = std::sync::Mutex::new(HashMap::<u8, (u32, u32)>::new());
     Box::new(move |p| {
-        if p.kind != hearth_core::KIND_VIDEO || p.payload.len() < 5 {
+        let label = match p.kind {
+            hearth_core::KIND_VIDEO => "video",
+            hearth_core::KIND_CAMERA => "camera",
+            _ => return,
+        };
+        if p.payload.len() < 5 {
             return;
         }
         let n = u32::from_be_bytes(p.payload[1..5].try_into().expect("4 bytes"));
         let ok = p.payload == test_frame(n, p.payload[0] == 1);
-        let mut s = state.lock().expect("video stats");
+        let mut all = state.lock().expect("video stats");
+        let s = all.entry(p.kind).or_default();
         s.0 += 1;
         if !ok {
             s.1 += 1;
         }
         if s.0.is_multiple_of(30) {
-            println!("[video] {} frames from {} ({} KB each), {} corrupt", s.0, p.from.fmt_short(), p.payload.len() / 1000, s.1);
+            println!("[{label}] {} frames from {} ({} KB each), {} corrupt", s.0, p.from.fmt_short(), p.payload.len() / 1000, s.1);
         }
     })
 }
@@ -230,11 +237,12 @@ struct Repl {
     record: Option<PathBuf>,
     video_test: bool,
     streaming: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    camera: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Repl {
     fn new(hearth: Hearth) -> Self {
-        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None, video_test: false, streaming: None }
+        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None, video_test: false, streaming: None, camera: None }
     }
 
     async fn run(mut self, mut updates: tokio::sync::mpsc::UnboundedReceiver<Update>, peers: Vec<PeerId>) -> Result<()> {
@@ -490,7 +498,7 @@ impl Repl {
                 println!("watching {}", self.who(&peer));
             }
             "/leave" => {
-                if let Some(s) = self.streaming.take() {
+                for s in [self.streaming.take(), self.camera.take()].into_iter().flatten() {
                     s.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.audio = None;
@@ -498,11 +506,40 @@ impl Repl {
                 println!("left voice");
             }
             "/mute" | "/deafen" => {
+                use std::sync::atomic::Ordering::Relaxed;
                 let a = self.audio.as_ref().context("not in voice")?;
                 let flag = if cmd == "/mute" { &a.controls.muted } else { &a.controls.deafened };
-                let on = !flag.load(std::sync::atomic::Ordering::Relaxed);
-                flag.store(on, std::sync::atomic::Ordering::Relaxed);
+                let on = !flag.load(Relaxed);
+                flag.store(on, Relaxed);
+                let (muted, deafened) = (a.controls.muted.load(Relaxed), a.controls.deafened.load(Relaxed));
+                self.hearth.set_voice_flags(muted, deafened).await?;
                 println!("{} {}", &cmd[1..], if on { "on" } else { "off" });
+            }
+            "/cam" | "/nocam" => {
+                let a = self.audio.as_ref().context("join voice first")?;
+                if let Some(s) = self.camera.take() {
+                    s.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                let on = cmd == "/cam";
+                if on {
+                    if !self.video_test {
+                        bail!("the CLI has no camera; run with --video-test to send synthetic frames");
+                    }
+                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (sender, flag) = (a.sender(), stop.clone());
+                    std::thread::spawn(move || {
+                        let mut n: u32 = 0;
+                        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(33));
+                            let key = n.is_multiple_of(60);
+                            sender.send_camera(&test_frame(n, key), key);
+                            n += 1;
+                        }
+                    });
+                    self.camera = Some(stop);
+                }
+                self.hearth.set_camera(on).await?;
+                println!("camera {}", if on { "on" } else { "off" });
             }
             "/dm" => {
                 let (who, text) = rest.split_once(' ').context("usage: /dm <friend> <text>")?;
@@ -597,7 +634,7 @@ impl Repl {
                 }
             }
             Update::Server { server, change } => self.server_change(server, change).await,
-            Update::KeyframeRequested | Update::Typing { .. } | Update::Speaking { .. } => {}
+            Update::KeyframeRequested { .. } | Update::Typing { .. } | Update::Speaking { .. } => {}
             Update::Friend { peer, request } => {
                 let state = self.hearth.friends().await.ok().and_then(|v| v.into_iter().find(|f| f.peer == peer));
                 match state.map(|f| (f.state, f.dm.is_some())) {
@@ -620,12 +657,23 @@ impl Repl {
                     self.current = None;
                 }
             }
-            Update::Voice { server, channel, peers, .. } => {
+            Update::Voice { server, channel, peers, live, camera, muted, deafened } => {
                 let Some(s) = self.hearth.servers().await.ok().and_then(|v| v.into_iter().find(|s| s.id == server)) else {
                     return;
                 };
                 let ch = s.channels.iter().find(|c| c.id == channel).map(|c| c.name.clone()).unwrap_or_default();
-                let names: Vec<String> = peers.iter().map(|p| self.who(p)).collect();
+                let names: Vec<String> = peers
+                    .iter()
+                    .map(|p| {
+                        let mut tags = Vec::new();
+                        for (list, tag) in [(&muted, "muted"), (&deafened, "deafened"), (&camera, "cam"), (&live, "live")] {
+                            if list.contains(p) {
+                                tags.push(tag);
+                            }
+                        }
+                        if tags.is_empty() { self.who(p) } else { format!("{} ({})", self.who(p), tags.join(", ")) }
+                    })
+                    .collect();
                 println!("* 🔊{ch}: {}", if names.is_empty() { "(empty)".into() } else { names.join(", ") });
             }
         }

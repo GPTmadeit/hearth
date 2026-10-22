@@ -52,9 +52,24 @@ const handlers = {
   online: () => [BOB],
   friends: () => structuredClone(db.friends),
   // Bob was already in voice before this window opened: the snapshot must show him.
-  voice_snapshot: () => [{ server: DEN, channel: DEN_VOICE, peers: [BOB], live: [] }],
+  voice_snapshot: () => [{ server: DEN, channel: DEN_VOICE, peers: [BOB], live: [], camera: [], muted: [BOB], deafened: [] }],
   avatars: () => ({}),
-  video_channel: () => null,
+  video_channel: ({ channel }) => {
+    window.__video = channel;
+  },
+  set_camera: () => null,
+  set_live: () => null,
+  watch: () => null,
+  // Loop our camera back as Bob's, so the receive path (decode -> tile) is exercised too.
+  push_camera: (bytes) => {
+    const out = new Uint8Array(33 + bytes.length);
+    out[0] = 3;
+    out.set(Uint8Array.from(BOB.match(/../g).map((h) => parseInt(h, 16))), 1);
+    out.set(bytes, 33);
+    window.__video?.onmessage?.(out.buffer);
+    return 1;
+  },
+  push_video: () => 1,
   servers: () => structuredClone(db.servers),
   history: ({ channel }) => structuredClone(db.messages[channel] || []),
   create_server: ({ name }) => {
@@ -161,6 +176,24 @@ window.__TAURI__ = {
   },
   event: { listen: async (_name, cb) => (listener = cb) },
 };
+
+// A synthetic camera/screen: an animated canvas, so capture -> encode -> decode runs for real.
+function fakeStream() {
+  const c = document.createElement("canvas");
+  c.width = 640;
+  c.height = 360;
+  const ctx = c.getContext("2d");
+  let t = 0;
+  setInterval(() => {
+    ctx.fillStyle = `hsl(${(t += 7) % 360} 70% 50%)`;
+    ctx.fillRect(0, 0, 640, 360);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect((t * 3) % 600, 150, 40, 40);
+  }, 33);
+  return c.captureStream(30);
+}
+navigator.mediaDevices.getUserMedia = async () => fakeStream();
+navigator.mediaDevices.getDisplayMedia = async () => fakeStream();
 
 // ---- helpers ----
 
@@ -399,6 +432,61 @@ async function run() {
     await until("voice panel", () => !q("#voice-panel").hidden);
     q("#hangup").click();
     await until("voice_leave call", () => called("voice_leave").length === 1);
+  });
+
+  await test("call view: tiles, others' mute state, controls", async () => {
+    q("[data-voice]").click();
+    await until("call view", () => q("#call.full .tiles"));
+    await until("bob and me tiles", () => q(`.tile[data-peer="${BOB}"]`) && q(`.tile[data-peer="${ME}"]`));
+    await until("bob shown muted", () => q(`.tile[data-peer="${BOB}"] .tile-label`)?.textContent.includes("🔇"));
+    for (const c of ["mute", "deafen", "camera", "share", "leave"]) if (!q(`[data-ctl="${c}"]`)) throw new Error(`no ${c} control`);
+    emit({ type: "speaking", server: DEN, peer: BOB, speaking: true });
+    await until("speaking border", () => q(`.tile[data-peer="${BOB}"]`).classList.contains("speaking"));
+  });
+
+  await test("camera: own preview, frames out, peer video in", async () => {
+    emit({ type: "voice", server: DEN, channel: DEN_VOICE, peers: [BOB, ME], live: [], camera: [BOB, ME], muted: [], deafened: [] });
+    q('[data-ctl="camera"]').click();
+    await until("set_camera on", () => called("set_camera").some((c) => c.args.on));
+    await until("own preview", () => q(`.tile[data-peer="${ME}"] video.mirror`));
+    await until("keyframe pushed", () => called("push_camera").some((c) => c.args[0] & 1), 6000);
+    await until("bob's camera decoded", () => q(`.tile[data-peer="${BOB}"] canvas`)?.width > 0, 8000);
+  });
+
+  await test("focus a tile", async () => {
+    q(`.tile[data-peer="${BOB}"]`).click();
+    await until("spotlight", () => q(".tiles.spotlight .tile.big")?.dataset.peer === BOB);
+    q(".tiles.spotlight .tile.big").click();
+    await until("grid again", () => !q(".tiles.spotlight"));
+  });
+
+  await test("screen share shows your own preview", async () => {
+    emit({ type: "voice", server: DEN, channel: DEN_VOICE, peers: [BOB, ME], live: [ME], camera: [BOB, ME], muted: [], deafened: [] });
+    q('[data-ctl="share"]').click();
+    await until("set_live", () => called("set_live").some((c) => c.args.live));
+    await until("own screen tile", () => q(`.tile[data-tile="2|${ME}"] video`));
+    q('[data-ctl="share"]').click();
+    await until("stopped", () => called("set_live").some((c) => !c.args.live));
+  });
+
+  await test("leave the call from the controls", async () => {
+    q('[data-ctl="leave"]').click();
+    await until("voice_leave", () => called("voice_leave").length >= 2);
+    await until("camera off", () => called("set_camera").some((c) => !c.args.on));
+  });
+
+  await test("DM call area shows and joins", async () => {
+    emit({ type: "voice", server: DM, channel: DM_VOICE, peers: [BOB], live: [], camera: [], muted: [], deafened: [] });
+    q(".rail-btn.home").click();
+    await until("dm entry", () => q(`[data-dm="${DM}"]`));
+    q(`[data-dm="${DM}"]`).click();
+    await until("call area", () => q("#call.compact:not([hidden]) .tile"));
+    q('[data-ctl="join"]').click();
+    await until("joined dm call", () => called("voice_join").some((c) => c.args.server === DM));
+    await until("controls", () => q('#call.compact [data-ctl="leave"]'));
+    q('#call.compact [data-ctl="leave"]').click();
+    [...document.querySelectorAll(".rail-btn")].find((b) => b.title === "The Den").click();
+    await until("den", () => q("#server-header").textContent.includes("The Den"));
   });
 
   await test("invite a peer", async () => {

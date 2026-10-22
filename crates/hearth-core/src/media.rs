@@ -32,8 +32,10 @@ const HEADER: usize = 1 + 8 + 4 + 24;
 
 /// Opus voice frames.
 pub const KIND_AUDIO: u8 = 1;
-/// Encoded screen-share frames.
+/// Encoded screen-share frames (sent only to viewers who asked).
 pub const KIND_VIDEO: u8 = 2;
+/// Encoded camera frames (sent to everyone in the call).
+pub const KIND_CAMERA: u8 = 3;
 
 /// Video frames allowed in flight per viewer before non-key frames are skipped.
 const MAX_INFLIGHT: usize = 4;
@@ -124,7 +126,7 @@ struct Room {
     keys: BTreeMap<u32, [u8; 32]>,
     peers: HashMap<PeerId, Connection>,
     watchers: HashSet<PeerId>,
-    inflight: HashMap<PeerId, Arc<AtomicUsize>>,
+    inflight: HashMap<(u8, PeerId), Arc<AtomicUsize>>,
     seq: u32,
     replay: HashMap<PeerId, Replay>,
 }
@@ -180,7 +182,7 @@ impl MediaHub {
                 r.epoch = cfg.epoch;
                 r.keys = keys;
                 r.replay.retain(|p, _| peers.contains_key(p));
-                r.inflight.retain(|p, _| watchers.contains(p));
+                r.inflight.retain(|(_, p), _| peers.contains_key(p));
                 r.peers = peers;
                 r.watchers = watchers;
             }
@@ -218,21 +220,33 @@ impl MediaHub {
         sent
     }
 
-    /// Sends one encoded video frame to each watcher on its own QUIC stream.
-    /// Viewers who are falling behind skip non-key frames until they catch up.
-    /// Safe to call from any thread. Returns how many viewers it went to.
+    /// Sends one encoded screen-share frame to each watcher. See [`MediaHub::send_video`].
     pub fn send_frame(&self, payload: &[u8], keyframe: bool) -> usize {
+        self.send_video(KIND_VIDEO, payload, keyframe)
+    }
+
+    /// Sends one encoded camera frame to everyone in the call.
+    pub fn send_camera(&self, payload: &[u8], keyframe: bool) -> usize {
+        self.send_video(KIND_CAMERA, payload, keyframe)
+    }
+
+    /// Sends a video frame on its own QUIC stream per recipient: screen shares
+    /// go to watchers, cameras to everyone. Recipients who are falling behind
+    /// skip non-key frames until they catch up. Safe to call from any thread.
+    fn send_video(&self, kind: u8, payload: &[u8], keyframe: bool) -> usize {
         let Some(rt) = self.runtime.lock().expect("media lock").clone() else { return 0 };
         let mut guard = self.room.lock().expect("media lock");
         let Some(room) = guard.as_mut() else { return 0 };
-        if room.watchers.is_empty() || payload.len() > MAX_VIDEO_FRAME {
+        let targets: Vec<PeerId> =
+            if kind == KIND_VIDEO { room.watchers.iter().copied().collect() } else { room.peers.keys().copied().collect() };
+        if targets.is_empty() || payload.len() > MAX_VIDEO_FRAME {
             return 0;
         }
-        let Some(packet) = room.seal(KIND_VIDEO, payload) else { return 0 };
+        let Some(packet) = room.seal(kind, payload) else { return 0 };
         let mut sent = 0;
-        for w in room.watchers.clone() {
+        for w in targets {
             let Some(conn) = room.peers.get(&w).cloned() else { continue };
-            let inflight = room.inflight.entry(w).or_default().clone();
+            let inflight = room.inflight.entry((kind, w)).or_default().clone();
             if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT && !keyframe {
                 continue;
             }
@@ -319,6 +333,11 @@ impl MediaSender {
     /// See [`MediaHub::send_frame`].
     pub fn send_frame(&self, payload: &[u8], keyframe: bool) -> usize {
         self.hub.send_frame(payload, keyframe)
+    }
+
+    /// See [`MediaHub::send_camera`].
+    pub fn send_camera(&self, payload: &[u8], keyframe: bool) -> usize {
+        self.hub.send_camera(payload, keyframe)
     }
 }
 

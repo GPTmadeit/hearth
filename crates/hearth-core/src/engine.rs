@@ -59,10 +59,20 @@ pub enum Update {
     Dm { peer: PeerId, body: String, sent_at_ms: u64 },
     Invited { server: ServerId, from: PeerId, name: String },
     Server { server: ServerId, change: Change },
-    /// Who is in a voice channel now, and who among them is streaming.
-    Voice { server: ServerId, channel: EventId, peers: Vec<PeerId>, live: Vec<PeerId> },
-    /// Someone started watching our stream: the next video frame should be a keyframe.
-    KeyframeRequested,
+    /// Who is in a voice channel now, and who among them is streaming,
+    /// has their camera on, or is muted/deafened.
+    Voice {
+        server: ServerId,
+        channel: EventId,
+        peers: Vec<PeerId>,
+        live: Vec<PeerId>,
+        camera: Vec<PeerId>,
+        muted: Vec<PeerId>,
+        deafened: Vec<PeerId>,
+    },
+    /// Someone new needs a picture from us: the next screen (`camera: false`)
+    /// or camera (`camera: true`) frame should be a keyframe.
+    KeyframeRequested { camera: bool },
     /// A member in voice started or stopped talking (including us).
     Speaking { server: ServerId, peer: PeerId, speaking: bool },
     Typing { server: ServerId, channel: EventId, peer: PeerId },
@@ -89,6 +99,9 @@ pub struct VoiceRoom {
     pub channel: EventId,
     pub peers: Vec<PeerId>,
     pub live: Vec<PeerId>,
+    pub camera: Vec<PeerId>,
+    pub muted: Vec<PeerId>,
+    pub deafened: Vec<PeerId>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +166,7 @@ impl Hearth {
             my_voice: None,
             watchers: HashSet::new(),
             speaking: false,
+            my_flags: (false, false),
             blobs: blobs.clone(),
             friends: HashMap::new(),
             dms: HashMap::new(),
@@ -265,6 +279,24 @@ impl Hearth {
     /// Starts or stops announcing that we're streaming our screen.
     pub async fn set_live(&self, live: bool) -> Result<()> {
         self.call(move |e| e.set_live(live)).await?
+    }
+
+    /// Starts or stops announcing that our camera is on.
+    pub async fn set_camera(&self, on: bool) -> Result<()> {
+        self.call(move |e| e.update_my_slot(|s| s.camera = on)).await?
+    }
+
+    /// Tells others in the call whether we're muted or deafened (for their indicators).
+    pub async fn set_voice_flags(&self, muted: bool, deafened: bool) -> Result<()> {
+        self.call(move |e| {
+            e.my_flags = (muted, deafened);
+            e.update_my_slot(|s| {
+                s.muted = muted;
+                s.deafened = deafened;
+            })
+            .or(Ok(()))
+        })
+        .await?
     }
 
     /// Asks `streamer` (in our voice channel) to start or stop sending us their stream.
@@ -430,6 +462,15 @@ struct PeerConn {
 struct VoiceSlot {
     channel: EventId,
     live: bool,
+    camera: bool,
+    muted: bool,
+    deafened: bool,
+}
+
+impl VoiceSlot {
+    fn new(channel: EventId) -> Self {
+        Self { channel, live: false, camera: false, muted: false, deafened: false }
+    }
 }
 
 struct Engine {
@@ -449,6 +490,8 @@ struct Engine {
     watchers: HashSet<PeerId>,
     /// Whether we're talking right now (for others' indicators).
     speaking: bool,
+    /// (muted, deafened), kept across calls.
+    my_flags: (bool, bool),
     blobs: Arc<BlobStore>,
     friends: HashMap<PeerId, FriendRecord>,
     /// DM conversation -> the friend it's with.
@@ -609,8 +652,10 @@ impl Engine {
             && self.servers[&server].is_member(&peer)
         {
             let me = self.me();
-            let live = self.voice.get(&server).and_then(|r| r.get(&me)).is_some_and(|s| s.live);
-            self.send_to(&peer, Frame::Voice { server, channel: Some(channel), live });
+            let slot = self.voice.get(&server).and_then(|r| r.get(&me)).copied().unwrap_or(VoiceSlot::new(channel));
+            for f in voice_frames(server, Some(slot)) {
+                self.send_to(&peer, f);
+            }
             if self.speaking {
                 self.send_to(&peer, Frame::Speaking { server, speaking: true });
             }
@@ -694,7 +739,19 @@ impl Engine {
             }
             Frame::Voice { server, channel, live } => {
                 if self.servers.get(&server).is_some_and(|s| s.is_member(&peer)) {
-                    self.set_voice(Some(server), peer, channel.map(|channel| VoiceSlot { channel, live }));
+                    // Legacy frame: keep flags we already know for the same channel.
+                    let known = self.voice.get(&server).and_then(|r| r.get(&peer)).copied();
+                    let slot = channel.map(|channel| match known {
+                        Some(k) if k.channel == channel => VoiceSlot { live, ..k },
+                        _ => VoiceSlot { live, ..VoiceSlot::new(channel) },
+                    });
+                    self.set_voice(Some(server), peer, slot);
+                }
+            }
+            Frame::VoiceState { server, channel, live, camera, muted, deafened } => {
+                if self.servers.get(&server).is_some_and(|s| s.is_member(&peer)) {
+                    let slot = channel.map(|channel| VoiceSlot { channel, live, camera, muted, deafened });
+                    self.set_voice(Some(server), peer, slot);
                 }
             }
             Frame::Watch { server, on } => self.on_watch(peer, server, on),
@@ -964,7 +1021,8 @@ impl Engine {
         self.media.set_sink(Some(tx));
         self.my_voice = Some((server, channel));
         let me = self.me();
-        self.set_voice(Some(server), me, Some(VoiceSlot { channel, live: false }));
+        let (muted, deafened) = self.my_flags;
+        self.set_voice(Some(server), me, Some(VoiceSlot { muted, deafened, ..VoiceSlot::new(channel) }));
         Ok(VoiceSession { hub: self.media.clone(), incoming: rx })
     }
 
@@ -978,12 +1036,19 @@ impl Engine {
     }
 
     fn set_live(&mut self, live: bool) -> Result<()> {
-        let (server, channel) = self.my_voice.context("join a voice channel first")?;
         if !live {
             self.watchers.clear();
         }
+        self.update_my_slot(|s| s.live = live)
+    }
+
+    /// Changes our own voice flags and tells everyone.
+    fn update_my_slot(&mut self, f: impl FnOnce(&mut VoiceSlot)) -> Result<()> {
+        let (server, channel) = self.my_voice.context("join a voice channel first")?;
         let me = self.me();
-        self.set_voice(Some(server), me, Some(VoiceSlot { channel, live }));
+        let mut slot = self.voice.get(&server).and_then(|r| r.get(&me)).copied().unwrap_or(VoiceSlot::new(channel));
+        f(&mut slot);
+        self.set_voice(Some(server), me, Some(slot));
         Ok(())
     }
 
@@ -1009,7 +1074,7 @@ impl Engine {
         if changed {
             self.refresh_media();
             if on {
-                self.emit(Update::KeyframeRequested);
+                self.emit(Update::KeyframeRequested { camera: false });
             }
         }
     }
@@ -1034,21 +1099,41 @@ impl Engine {
             if slot.is_none_or(|s| !s.live) {
                 self.watchers.remove(&peer);
             }
-            let rooms = &self.voice[&sid];
             let mut channels: Vec<EventId> = [before, slot].into_iter().flatten().map(|s| s.channel).collect();
             channels.dedup();
             for c in channels {
-                let here = rooms.iter().filter(|(_, s)| s.channel == c);
-                let peers = here.clone().map(|(p, _)| *p).collect();
-                let live = here.filter(|(_, s)| s.live).map(|(p, _)| *p).collect();
-                let _ = self.updates.send(Update::Voice { server: sid, channel: c, peers, live });
+                if let Some(room) = room_view(sid, c, &self.voice[&sid]) {
+                    let VoiceRoom { peers, live, camera, muted, deafened, .. } = room;
+                    let _ = self.updates.send(Update::Voice { server: sid, channel: c, peers, live, camera, muted, deafened });
+                } else {
+                    let none = Vec::new;
+                    let _ = self.updates.send(Update::Voice {
+                        server: sid,
+                        channel: c,
+                        peers: none(),
+                        live: none(),
+                        camera: none(),
+                        muted: none(),
+                        deafened: none(),
+                    });
+                }
             }
-            if peer == self.me()
+            let me = self.me();
+            // Someone new arrived in our call while our camera is on: send them a picture now.
+            let arrived = slot.map(|s| s.channel) != before.map(|s| s.channel);
+            if peer != me && arrived && self.my_voice == slot.map(|s| (sid, s.channel)) {
+                let camera_on = self.voice[&sid].get(&me).is_some_and(|s| s.camera);
+                if camera_on {
+                    self.emit(Update::KeyframeRequested { camera: true });
+                }
+            }
+            if peer == me
                 && let Some(s) = self.servers.get(&sid)
             {
-                let frame = Frame::Voice { server: sid, channel: slot.map(|s| s.channel), live: slot.is_some_and(|s| s.live) };
                 for m in s.members() {
-                    self.send_to(&m, frame.clone());
+                    for f in voice_frames(sid, slot) {
+                        self.send_to(&m, f);
+                    }
                 }
             }
         }
@@ -1096,20 +1181,8 @@ impl Engine {
     fn voice_rooms(&self) -> Vec<VoiceRoom> {
         let mut out = Vec::new();
         for (server, rooms) in &self.voice {
-            let mut by_channel: HashMap<EventId, VoiceRoom> = HashMap::new();
-            for (peer, slot) in rooms {
-                let room = by_channel.entry(slot.channel).or_insert_with(|| VoiceRoom {
-                    server: *server,
-                    channel: slot.channel,
-                    peers: Vec::new(),
-                    live: Vec::new(),
-                });
-                room.peers.push(*peer);
-                if slot.live {
-                    room.live.push(*peer);
-                }
-            }
-            out.extend(by_channel.into_values());
+            let channels: HashSet<EventId> = rooms.values().map(|s| s.channel).collect();
+            out.extend(channels.into_iter().filter_map(|c| room_view(*server, c, rooms)));
         }
         out
     }
@@ -1520,6 +1593,35 @@ async fn drive(conn: Connection, mut send: SendStream, mut recv: RecvStream, dia
     .await;
     let _ = inbox.send(Inbox::Closed { peer, id });
     result
+}
+
+/// Who's in `channel` and with which flags, or `None` if nobody is.
+fn room_view(server: ServerId, channel: EventId, rooms: &HashMap<PeerId, VoiceSlot>) -> Option<VoiceRoom> {
+    let here: Vec<(&PeerId, &VoiceSlot)> = rooms.iter().filter(|(_, s)| s.channel == channel).collect();
+    if here.is_empty() {
+        return None;
+    }
+    let pick = |f: fn(&VoiceSlot) -> bool| here.iter().filter(|(_, s)| f(s)).map(|(p, _)| **p).collect();
+    Some(VoiceRoom {
+        server,
+        channel,
+        peers: here.iter().map(|(p, _)| **p).collect(),
+        live: pick(|s| s.live),
+        camera: pick(|s| s.camera),
+        muted: pick(|s| s.muted),
+        deafened: pick(|s| s.deafened),
+    })
+}
+
+/// Our voice state as frames: the legacy one older peers understand, then the full one.
+fn voice_frames(server: ServerId, slot: Option<VoiceSlot>) -> [Frame; 2] {
+    let channel = slot.map(|s| s.channel);
+    let flag = |f: fn(&VoiceSlot) -> bool| slot.as_ref().is_some_and(f);
+    let live = flag(|s| s.live);
+    [
+        Frame::Voice { server, channel, live },
+        Frame::VoiceState { server, channel, live, camera: flag(|s| s.camera), muted: flag(|s| s.muted), deafened: flag(|s| s.deafened) },
+    ]
 }
 
 fn now_ms() -> u64 {

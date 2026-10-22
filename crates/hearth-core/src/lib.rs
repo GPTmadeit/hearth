@@ -20,7 +20,7 @@ pub use blob::BlobRef;
 pub use event::Attachment;
 pub use store::FriendState;
 pub use iroh::RelayUrl;
-pub use media::{KIND_AUDIO, KIND_VIDEO, MAX_VIDEO_FRAME, MediaPacket, MediaSender, VoiceSession};
+pub use media::{KIND_AUDIO, KIND_CAMERA, KIND_VIDEO, MAX_VIDEO_FRAME, MediaPacket, MediaSender, VoiceSession};
 pub use event::{ChannelKind, EventId, ServerId};
 pub use iroh::{EndpointId as PeerId, SecretKey};
 pub use state::{Change, Channel, ChatMessage};

@@ -52,6 +52,8 @@ pub enum Frame {
     BlobOffer { server: ServerId, hash: [u8; 32], size: u64 },
     /// The sender's display name and profile picture.
     Profile { name: String, avatar: Option<BlobRef> },
+    /// Full voice state (0.3+). Sent after the legacy `Voice` frame, which older peers still read.
+    VoiceState { server: ServerId, channel: Option<EventId>, live: bool, camera: bool, muted: bool, deafened: bool },
 }
 
 pub async fn write(send: &mut SendStream, frame: &Frame) -> Result<()> {

@@ -63,7 +63,7 @@ def main():
     url = f"http://127.0.0.1:{server.server_address[1]}/index.html"
     try:
         out = subprocess.run(
-            [find_chrome(), "--headless=new", "--no-sandbox", "--disable-gpu", "--virtual-time-budget=20000", "--dump-dom", url],
+            [find_chrome(), "--headless=new", "--no-sandbox", "--disable-gpu", "--virtual-time-budget=60000", "--dump-dom", url],
             capture_output=True,
             timeout=120,
         ).stdout.decode("utf-8", "replace")

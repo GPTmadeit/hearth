@@ -154,6 +154,19 @@ def main():
             assert m.group(1) == "0", f"{m.group(1)} corrupt frames"
             alice.send("/unlive")
 
+        def camera_and_flags():
+            # Cameras reach everyone in the call without anyone asking to watch.
+            b = bob.mark()
+            alice.send("/cam")
+            bob.wait_for(r"General: .*alice \(cam\)", after=b)
+            m = bob.wait_for(r"\[camera\] 60 frames .* (\d+) corrupt", timeout=45, after=b)
+            assert m.group(1) == "0", f"{m.group(1)} corrupt camera frames"
+            alice.send("/nocam")
+            b = bob.mark()
+            alice.send("/mute")
+            bob.wait_for(r"General: .*alice \(muted\)", after=b)
+            alice.send("/mute")
+
         def friends_and_dms():
             alice.send("/friend bob")
             bob.wait_for(r"alice sent you a friend request")
@@ -210,6 +223,7 @@ def main():
         check("chat both ways", chat)
         check("voice channel presence", voice)
         check("screen-share frames, verified", screen_share)
+        check("camera frames to everyone, mute shown to others", camera_and_flags)
         check("friend request, accept, and DMs both ways", friends_and_dms)
         check("reactions", reactions)
         check("3 MB file transfer, byte-verified", file_transfer)

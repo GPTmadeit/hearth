@@ -1359,3 +1359,237 @@ select {
 .emoji-grid button:hover {
   background: var(--hover);
 }
+
+/* ================= 0.3: call view ================= */
+
+.call {
+  background: #111214;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.call.full {
+  flex: 1;
+}
+
+.call.compact {
+  height: 46vh;
+  min-height: 260px;
+  flex: none;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.4);
+}
+
+.call[hidden] {
+  display: none;
+}
+
+.tiles {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  place-content: center;
+  grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr));
+  grid-auto-rows: minmax(0, 1fr);
+}
+
+.tiles.n1 {
+  --cols: 1;
+  padding: 16px 12%;
+}
+
+.tiles.n2 {
+  --cols: 2;
+}
+
+.tiles.n3,
+.tiles.n4 {
+  --cols: 2;
+}
+
+.tiles.n5,
+.tiles.n6,
+.tiles.n7,
+.tiles.n8,
+.tiles.n9 {
+  --cols: 3;
+}
+
+.tile {
+  position: relative;
+  background: var(--tint, #2b2d31);
+  border-radius: 10px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  max-height: 100%;
+  width: 100%;
+  margin: auto;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+
+.tile.has-video {
+  background: #000;
+}
+
+.tile.speaking::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 3px var(--green);
+  pointer-events: none;
+}
+
+.tile video,
+.tile canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.tile video.mirror {
+  transform: scaleX(-1);
+}
+
+.tile .avatar.xl {
+  width: 96px;
+  height: 96px;
+  font-size: 38px;
+}
+
+.call.compact .tile .avatar.xl {
+  width: 64px;
+  height: 64px;
+  font-size: 26px;
+}
+
+.tile-screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.tile-label {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.6);
+  color: white;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 6px;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tile-close {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  background: rgba(0, 0, 0, 0.6);
+  color: white;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.tiles.spotlight {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+}
+
+.tiles.spotlight .tile.big {
+  flex: 1;
+  min-height: 0;
+  aspect-ratio: auto;
+}
+
+.tiles.spotlight .strip {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  height: 96px;
+  flex: none;
+}
+
+.tiles.spotlight .strip .tile {
+  width: auto;
+  height: 100%;
+  margin: 0;
+}
+
+.tiles.spotlight .strip .avatar.xl {
+  width: 44px;
+  height: 44px;
+  font-size: 18px;
+}
+
+.call-controls {
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+  padding: 12px;
+  flex: none;
+}
+
+.ctl {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: #2b2d31;
+  font-size: 22px;
+}
+
+.ctl:hover {
+  background: #3a3c42;
+}
+
+.ctl.off {
+  background: #fff;
+  color: var(--red);
+}
+
+.ctl.on {
+  background: var(--green);
+}
+
+.ctl.leave {
+  background: var(--red);
+  transform: rotate(135deg);
+}
+
+.ctl.leave:hover {
+  filter: brightness(1.1);
+}
+
+.join-call {
+  background: var(--green);
+  color: white;
+  padding: 10px 22px;
+  font-weight: 600;
+}
+
+#voice-panel .state {
+  text-align: left;
+  padding: 0;
+}
+
+#voice-panel .state:hover {
+  text-decoration: underline;
+}
+
+.channel.connected .glyph {
+  color: var(--green);
+}
