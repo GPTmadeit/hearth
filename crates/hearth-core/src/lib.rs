@@ -1,13 +1,19 @@
-//! hearth-core: identity, wire protocol, and peer-to-peer sessions.
+//! hearth-core: identity, servers, sync, and the peer-to-peer engine.
 //!
-//! Every user is an ed25519 keypair. The public key *is* the address: iroh
-//! dials peers by key, hole-punches where it can, and falls back to relays
-//! that only ever see QUIC/TLS ciphertext authenticated to that key.
+//! Every user is an ed25519 keypair, and the public key *is* the address:
+//! iroh dials peers by key, hole-punches where it can, and falls back to relays
+//! that only see QUIC/TLS ciphertext. Servers are replicated logs of signed
+//! events whose content is sealed under a per-epoch group key.
 
+pub mod crypto;
+pub mod engine;
+pub mod event;
 pub mod identity;
-pub mod node;
 pub mod proto;
+pub mod state;
+pub mod store;
 
+pub use engine::{Config, Hearth, ServerSummary, Update};
+pub use event::{ChannelKind, EventId, ServerId};
 pub use iroh::{EndpointId as PeerId, SecretKey};
-pub use node::{Event, Node, Session};
-pub use proto::Message;
+pub use state::{Change, Channel, ChatMessage};
