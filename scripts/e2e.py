@@ -20,6 +20,9 @@ import threading
 import time
 import wave
 
+# Windows consoles can't print every character peers send; never let logging crash a report.
+sys.stdout.reconfigure(errors="replace")
+
 BIN = os.path.abspath(sys.argv[1])
 WORK = tempfile.mkdtemp(prefix="hearth-e2e-")
 failures = []
@@ -207,8 +210,10 @@ def main():
         def offline_delivery():
             bob.quit()
             alice.send("posted while bob was away")
+            m = node.mark()
             alice.send(f"/attach {os.path.join(WORK, 'photo.jpg')} and a photo")
-            time.sleep(6)  # the node stores the message and fetches the file
+            node.wait_for(r"^stored a file for ", after=m, timeout=60)  # the node has its own copy
+            time.sleep(1)  # and the message events
             alice.quit()
             back = Peer("bob", "chat", "--name", "bob")
             peers.append(back)

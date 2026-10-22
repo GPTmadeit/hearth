@@ -170,6 +170,7 @@ async fn run_node(cfg: Config, auto_update: bool) -> Result<()> {
                 Update::Invited { server, from, .. } => println!("hosting {} for {}", server.short(), from.fmt_short()),
                 Update::PeerOnline { peer, name } => println!("+ {name} {}", peer.fmt_short()),
                 Update::PeerOffline { peer } => println!("- {}", peer.fmt_short()),
+                Update::BlobStored { server } => println!("stored a file for {}", server.short()),
                 Update::Server { server, change: Change::HostRemoved(p) } if p == hearth.id() => {
                     println!("no longer hosting {}", server.short())
                 }
@@ -728,6 +729,7 @@ impl Repl {
                 }
             }
             Update::Joined { server } => println!("* invite code accepted; syncing server {}", server.short()),
+            Update::BlobStored { .. } => {}
             Update::ServerRemoved { server } => {
                 if self.current.is_some_and(|c| c.0 == server) {
                     self.current = None;

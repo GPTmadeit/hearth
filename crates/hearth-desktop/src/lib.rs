@@ -224,6 +224,8 @@ fn to_dto(u: Update, me: PeerId) -> UpdateDto {
         Update::Server { server, .. } => UpdateDto::ServerChanged { server: server.to_string() },
         Update::ServerRemoved { server } => UpdateDto::ServerRemoved { server: server.to_string() },
         Update::Joined { server } => UpdateDto::Joined { server: server.to_string() },
+        // Only storage nodes see this; the app never runs as one.
+        Update::BlobStored { server } => UpdateDto::ServerChanged { server: server.to_string() },
         Update::Voice { server, channel, peers, live, camera, muted, deafened } => UpdateDto::Voice {
             server: server.to_string(),
             channel: eid(&channel),

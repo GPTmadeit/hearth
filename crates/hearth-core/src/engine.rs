@@ -87,6 +87,8 @@ pub enum Update {
     ServerRemoved { server: ServerId },
     /// An invite code we used was accepted; the server is syncing in.
     Joined { server: ServerId },
+    /// (Storage nodes only.) We now hold a copy of a file posted in `server`.
+    BlobStored { server: ServerId },
 }
 
 #[derive(Debug, Clone)]
@@ -1431,10 +1433,22 @@ impl Engine {
             return;
         }
         let Some(conn) = self.peers.get(&peer).map(|c| c.conn.clone()) else { return };
-        let blobs = self.blobs.clone();
+        let (blobs, updates) = (self.blobs.clone(), self.updates.clone());
         tokio::spawn(async move {
-            if let Ok(Ok(Some(ct))) = tokio::time::timeout(BLOB_TIMEOUT, blob::request(&conn, &hash)).await {
-                let _ = blobs.put(&hash, &ct);
+            // A few tries: this copy is what offline members will get the file from.
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                if let Ok(Ok(Some(ct))) = tokio::time::timeout(BLOB_TIMEOUT, blob::request(&conn, &hash)).await
+                    && blobs.put(&hash, &ct).is_ok()
+                {
+                    let _ = updates.send(Update::BlobStored { server });
+                    return;
+                }
+                if conn.close_reason().is_some() {
+                    return;
+                }
             }
         });
     }
