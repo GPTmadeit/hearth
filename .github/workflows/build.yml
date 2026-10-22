@@ -85,9 +85,60 @@ jobs:
           name: dist-windows
           path: dist/
 
+  android:
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+      - name: Android project
+        working-directory: crates/hearth-desktop
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME" ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo tauri android init --ci
+          python3 ../../scripts/android_patch.py gen/android
+      - name: Build APK
+        working-directory: crates/hearth-desktop
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME" ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo tauri android build --apk --target aarch64 --ci
+      - name: Sign
+        run: |
+          mkdir dist
+          version=$(python3 -c "import json; print(json.load(open('crates/hearth-desktop/tauri.conf.json'))['version'])")
+          unsigned=$(find crates/hearth-desktop/gen/android -name '*release*.apk' | head -1)
+          echo "built: $unsigned"
+          tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$tools/zipalign" -f -p 4 "$unsigned" aligned.apk
+          out="dist/Hearth_${version}_android-arm64.apk"
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            echo "$ANDROID_KEYSTORE_B64" | base64 -d > release.jks
+            "$tools/apksigner" sign --ks release.jks --ks-key-alias hearth --ks-pass env:ANDROID_KEYSTORE_PASSWORD --out "$out" aligned.apk
+            "$tools/apksigner" verify --print-certs "$out" | grep -i "sha-256"
+            rm release.jks
+          else
+            cp aligned.apk "$out" # unsigned on forks; not installable
+          fi
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android
+          path: dist/
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, windows]
+    needs: [linux, windows, android]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

@@ -1593,3 +1593,205 @@ select {
 .channel.connected .glyph {
   color: var(--green);
 }
+
+/* ================= phones & touch ================= */
+
+.nav-toggle {
+  display: none;
+}
+
+#scrim {
+  display: none;
+}
+
+@media (max-width: 760px) {
+  html,
+  body {
+    font-size: 16px;
+  }
+
+  #app {
+    grid-template-columns: 1fr;
+    height: 100dvh;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .nav-toggle {
+    display: inline-block;
+  }
+
+  .members-toggle {
+    margin-left: 4px;
+  }
+
+  #rail,
+  #sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    z-index: 15;
+    transition: transform 0.2s ease;
+  }
+
+  #rail {
+    left: 0;
+    width: 72px;
+    transform: translateX(-332px);
+    padding-top: calc(12px + env(safe-area-inset-top));
+  }
+
+  #sidebar {
+    left: 72px;
+    width: min(260px, calc(100vw - 72px));
+    transform: translateX(-332px);
+    padding-top: env(safe-area-inset-top);
+  }
+
+  body.nav-open #rail,
+  body.nav-open #sidebar {
+    transform: none;
+  }
+
+  #members {
+    position: fixed;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    width: min(280px, 85vw);
+    z-index: 15;
+    transform: translateX(100%);
+    transition: transform 0.2s ease;
+    display: block;
+    padding-top: calc(8px + env(safe-area-inset-top));
+  }
+
+  body.members-open #members {
+    transform: none;
+  }
+
+  body.nav-open #scrim,
+  body.members-open #scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 14;
+    background: rgba(0, 0, 0, 0.5);
+  }
+
+  .main-header {
+    padding: 0 8px;
+    gap: 4px;
+  }
+
+  .main-header .e2e {
+    display: none;
+  }
+
+  .tabs {
+    margin-left: 4px;
+    overflow-x: auto;
+  }
+
+  .msg {
+    grid-template-columns: 48px 1fr;
+    padding-right: 8px;
+  }
+
+  .reply-row {
+    padding-left: 48px;
+  }
+
+  .att {
+    max-width: 100%;
+  }
+
+  .composer {
+    padding: 0 8px 8px;
+  }
+
+  .tiles.n2,
+  .tiles.n3,
+  .tiles.n4 {
+    --cols: 1;
+  }
+
+  .tiles.n5,
+  .tiles.n6,
+  .tiles.n7,
+  .tiles.n8,
+  .tiles.n9 {
+    --cols: 2;
+  }
+
+  .call.compact {
+    height: 40vh;
+  }
+
+  .emoji-picker {
+    left: 8px !important;
+    right: 8px;
+    width: auto;
+  }
+}
+
+/* Touch screens have no hover: show message tools on tap, and keep actions visible. */
+@media (hover: none) {
+  .msg:hover {
+    background: none;
+  }
+
+  .msg:hover .msg-tools {
+    display: none;
+  }
+
+  .msg.active {
+    background: rgba(0, 0, 0, 0.12);
+  }
+
+  .msg.active .msg-tools {
+    display: flex;
+  }
+
+  .member-actions,
+  .reaction.add {
+    visibility: visible;
+  }
+
+  .msg-tools button {
+    padding: 8px 12px;
+  }
+}
+
+/* Tiles scroll when there are more than fit; the controls always stay on screen. */
+.tiles {
+  overflow-y: auto;
+}
+
+@media (max-width: 760px) {
+  .tiles:not(.spotlight) {
+    grid-auto-rows: auto;
+    place-content: start stretch;
+    padding: 8px;
+  }
+
+  .call-controls {
+    padding: 8px 8px calc(8px + env(safe-area-inset-bottom));
+    gap: 10px;
+  }
+
+  .ctl {
+    width: 48px;
+    height: 48px;
+  }
+}
+
+/* The single grid row must stay the window's height; overflow scrolls inside panes. */
+#app {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+#main {
+  min-height: 0;
+  overflow: hidden;
+}

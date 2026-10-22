@@ -10,6 +10,7 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
 const MAX_FILE = 100 * 1024 * 1024;
+const ANDROID = /Android/i.test(navigator.userAgent);
 const AUTOLOAD_MEDIA = 25 * 1024 * 1024;
 
 const state = {
@@ -226,6 +227,30 @@ function modal({ title, body = "", fields = [], submit = "OK", onSubmit, extra =
   return root;
 }
 
+/** Drawer and member-list toggles, shown only on narrow screens. */
+function navButtons() {
+  return `<button class="icon-btn big nav-toggle" data-toggle="nav-open" title="Menu">☰</button>`;
+}
+
+function membersButton() {
+  return `<button class="icon-btn big nav-toggle members-toggle" data-toggle="members-open" title="Members">👥</button>`;
+}
+
+function closeDrawers() {
+  document.body.classList.remove("nav-open", "members-open");
+}
+
+document.addEventListener("click", (e) => {
+  if (e.target.id === "scrim") return closeDrawers();
+  const t = e.target.closest("[data-toggle]");
+  if (t) {
+    const cls = t.dataset.toggle;
+    const on = !document.body.classList.contains(cls);
+    closeDrawers();
+    document.body.classList.toggle(cls, on);
+  }
+});
+
 function idBox(id) {
   return `<div class="copybox"><span>${esc(id)}</span><button type="button" class="btn" data-copy="${esc(id)}">Copy</button></div>`;
 }
@@ -274,6 +299,7 @@ async function loadAvatar(peer, ref) {
 // ---------- navigation ----------
 
 async function openHome(tab = "friends") {
+  closeDrawers();
   state.view = "home";
   state.homeTab = tab;
   state.reply = state.editing = null;
@@ -287,6 +313,7 @@ async function openHome(tab = "friends") {
 }
 
 async function openServer(id) {
+  closeDrawers();
   state.callChannel = state.inVoice?.server === id ? state.callChannel : null;
   state.view = id;
   state.channel = textChannel(server(id))?.id || null;
@@ -297,6 +324,7 @@ async function openServer(id) {
 }
 
 function openCall(channel) {
+  closeDrawers();
   state.callChannel = channel;
   state.focus = null;
   renderMain();
@@ -304,6 +332,7 @@ function openCall(channel) {
 }
 
 async function openChannel(id) {
+  closeDrawers();
   state.callChannel = null;
   state.channel = id;
   state.reply = state.editing = null;
@@ -691,10 +720,10 @@ function renderVoicePanel() {
     <button class="state" id="open-call" title="Show the call">Voice connected</button>
     <div class="where">${esc(where)}</div>
     <div class="row">
-      <button class="pill${state.sharing ? " on" : ""}" id="share">${state.sharing ? "Stop sharing" : "Share screen"}</button>
+      ${navigator.mediaDevices?.getDisplayMedia ? `<button class="pill${state.sharing ? " on" : ""}" id="share">${state.sharing ? "Stop sharing" : "Share screen"}</button>` : ""}
       <button class="pill danger" id="hangup">Leave</button>
     </div>`;
-  $("#share").onclick = () => (state.sharing ? stopShare() : startShare());
+  $("#share")?.addEventListener("click", () => (state.sharing ? stopShare() : startShare()));
   $("#hangup").onclick = leaveVoice;
   $("#open-call").onclick = () => {
     const sv = state.inVoice.server;
@@ -731,7 +760,7 @@ function renderMain() {
   if (state.view === "home" && state.homeTab === "friends") return renderFriendsPage(main);
   if (state.view !== "home" && state.callChannel) {
     const ch = server()?.channels.find((c) => c.id === state.callChannel);
-    main.innerHTML = `<div class="main-header"><span class="glyph">🔊</span>${esc(ch?.name || "Voice")}<span class="e2e" title="Audio and video are encrypted for members of this server">🔒 end-to-end encrypted</span></div><div class="call full" id="call"></div>`;
+    main.innerHTML = `<div class="main-header">${navButtons()}<span class="glyph">🔊</span>${esc(ch?.name || "Voice")}<span class="e2e" title="Audio and video are encrypted for members of this server">🔒 end-to-end encrypted</span></div><div class="call full" id="call"></div>`;
     renderCall();
     return;
   }
@@ -747,7 +776,7 @@ function renderMain() {
   const callBtn = voiceCh ? `<button class="icon-btn big" id="call-btn" title="Start a call">📞</button>` : "";
   const placeholder = s.dm ? `Message @${who(s.dm)}` : `Message #${ch?.name || ""}`;
   main.innerHTML = `
-    <div class="main-header">${title}${callBtn}<span class="e2e" title="Only members can read this; nodes and relays see ciphertext">🔒 end-to-end encrypted</span></div>
+    <div class="main-header">${navButtons()}${title}${callBtn}<span class="e2e" title="Only members can read this; nodes and relays see ciphertext">🔒 end-to-end encrypted</span>${membersButton()}</div>
     ${s.dm ? `<div class="call compact" id="call"></div>` : ""}
     <div id="messages"></div>
     <div class="composer">
@@ -816,7 +845,7 @@ function renderFriendsPage(main) {
     })
     .join("");
   main.innerHTML = `
-    <div class="main-header"><span class="glyph">👥</span>Friends
+    <div class="main-header">${navButtons()}<span class="glyph">👥</span>Friends
       <nav class="tabs">${tabs.map(([t, l]) => `<button class="tab${state.friendsTab === t ? " active" : ""}" data-tab="${t}">${l}${t === "pending" && pendingCount ? ` <span class="count">${pendingCount}</span>` : ""}</button>`).join("")}
       <button class="tab add${state.friendsTab === "add" ? " active" : ""}" data-tab="add">Add friend</button></nav>
     </div>
@@ -998,6 +1027,12 @@ function wireMessages(el, s, list) {
   const byId = (id) => list.find((m) => m.id === id);
   el.querySelectorAll(".msg").forEach((row) => {
     const m = byId(row.dataset.id);
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button, a, img, video, audio")) return;
+      const was = row.classList.contains("active");
+      el.querySelectorAll(".msg.active").forEach((r) => r.classList.remove("active"));
+      row.classList.toggle("active", !was);
+    });
     row.querySelectorAll("[data-tool]").forEach((b) => {
       b.onclick = (e) => {
         e.stopPropagation();
@@ -1597,6 +1632,16 @@ async function resizeImage(file, size) {
 async function joinVoice(serverId, channel) {
   if (state.inVoice?.channel === channel) return;
   if (state.inVoice) await leaveVoice();
+  if (ANDROID) {
+    // Native audio can only open the mic once Android has granted the permission,
+    // and asking through the webview is what shows the system prompt.
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach((t) => t.stop());
+    } catch {
+      toast("Microphone permission was denied, so you'll join listen-only.", { error: true });
+    }
+  }
   const warnings = await call("voice_join", { server: serverId, channel });
   state.inVoice = { server: serverId, channel };
   for (const w of warnings) toast(w, { error: true, timeout: 8000 });
@@ -1986,7 +2031,7 @@ function renderCall() {
       <button class="ctl${state.muted ? " off" : ""}" data-ctl="mute" title="${state.muted ? "Unmute" : "Mute"}">${state.muted ? "🔇" : "🎙"}</button>
       <button class="ctl${state.deafened ? " off" : ""}" data-ctl="deafen" title="${state.deafened ? "Undeafen" : "Deafen"}">${state.deafened ? "🔕" : "🎧"}</button>
       <button class="ctl${state.camera ? " on" : ""}" data-ctl="camera" title="${state.camera ? "Turn off camera" : "Turn on camera"}">📷</button>
-      <button class="ctl${state.sharing ? " on" : ""}" data-ctl="share" title="${state.sharing ? "Stop sharing" : "Share your screen"}">🖥</button>
+      ${navigator.mediaDevices?.getDisplayMedia ? `<button class="ctl${state.sharing ? " on" : ""}" data-ctl="share" title="${state.sharing ? "Stop sharing" : "Share your screen"}">🖥</button>` : ""}
       <button class="ctl leave" data-ctl="leave" title="Leave call">📞</button>`;
   } else {
     bar.innerHTML = `<button class="btn join-call" data-ctl="join">Join call</button>`;

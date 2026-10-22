@@ -2225,6 +2225,8 @@ dependencies = [
  "directories",
  "hearth-core",
  "hearth-media",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tauri",
@@ -2234,6 +2236,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "urlencoding",
+ "webpki-roots",
 ]
 
 [[package]]
