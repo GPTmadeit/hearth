@@ -30,6 +30,8 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev libasound2-dev cmake libfuse2t64 xdg-utils
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: UI lint (undefined/unused names across modules)
+        run: crates/hearth-desktop/ui-test/lint.sh
       - name: Desktop UI flows
         run: python3 crates/hearth-desktop/ui-test/run.py
       - run: cargo build --release -p hearth-cli

@@ -1973,3 +1973,518 @@ select {
 .add-friend .btn {
   white-space: nowrap;
 }
+
+/* =====================================================================
+   Hearth theme: a warm ember look layered over the base styles.
+   Everything here is static paint: no blur, no backdrop filters, no
+   looping animations. Motion is short opacity/transform transitions only,
+   and off-screen messages are skipped entirely (content-visibility).
+   ===================================================================== */
+
+:root {
+  --rail: #111013;
+  --side: #18161a;
+  --main: #1f1c21;
+  --raised: #2a262c;
+  --input: #141216;
+  --hover: rgba(255, 240, 230, 0.045);
+  --active: rgba(255, 240, 230, 0.085);
+  --line: rgba(255, 240, 230, 0.07);
+  --text: #ece6e3;
+  --muted: #a99d9c;
+  --faint: #776c6c;
+  --accent: #ff7a33;
+  --accent-hot: #ff5a2a;
+  --accent-soft: rgba(255, 122, 51, 0.14);
+  --ember: linear-gradient(135deg, #ffa24d 0%, #ff7a33 45%, #ff4f2a 100%);
+  --green: #3ccf78;
+  --red: #f04848;
+  --radius: 10px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+html,
+body {
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Inter", Roboto, "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: rgba(255, 122, 51, 0.35);
+}
+
+/* Thin, quiet scrollbars. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 240, 230, 0.14) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 240, 230, 0.14);
+  border-radius: 10px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--input);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  width: 100%;
+  outline: none;
+}
+
+/* ---- rail ---- */
+
+#rail {
+  border-right: 1px solid var(--line);
+}
+
+.rail-btn {
+  background: var(--raised);
+  transition: border-radius 0.18s var(--ease), background-color 0.18s var(--ease), transform 0.12s var(--ease);
+}
+
+.rail-btn:hover,
+.rail-btn.active {
+  background: var(--ember);
+}
+
+.rail-btn:active {
+  transform: translateY(1px);
+}
+
+/* The pill to the left: a nub on hover, a tall bar on the open server. */
+.rail-btn::before {
+  content: "";
+  position: absolute;
+  left: -12px;
+  top: 50%;
+  width: 4px;
+  height: 40px;
+  margin-top: -20px;
+  border-radius: 0 4px 4px 0;
+  background: var(--text);
+  transform: scaleY(0);
+  transition: transform 0.18s var(--ease);
+}
+
+.rail-btn:hover::before {
+  transform: scaleY(0.25);
+}
+
+.rail-btn.active::before {
+  transform: scaleY(1);
+}
+
+.rail-btn.add,
+.rail-btn.add:hover {
+  background: var(--raised);
+}
+
+.rail-btn.add:hover {
+  background: var(--green);
+}
+
+.rail-btn .badge {
+  background: var(--red);
+  font-weight: 700;
+}
+
+/* ---- sidebar & channels ---- */
+
+#sidebar {
+  border-right: 1px solid var(--line);
+}
+
+.channel {
+  border-radius: 6px;
+  transition: background-color 0.12s, color 0.12s;
+}
+
+.channel.active {
+  background: var(--active);
+  color: var(--text);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.section-label {
+  letter-spacing: 0.06em;
+}
+
+/* ---- headers ---- */
+
+.main-header {
+  border-bottom: 1px solid var(--line);
+  background: var(--main);
+}
+
+.main-header .e2e {
+  color: var(--green);
+  opacity: 0.8;
+}
+
+/* ---- messages ---- */
+
+/* Off-screen messages cost nothing: the browser skips their layout and paint. */
+#messages .msg {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
+}
+
+.msg {
+  border-radius: 6px;
+  transition: background-color 0.1s;
+}
+
+.msg:hover {
+  background: var(--hover);
+}
+
+.msg-meta .author {
+  font-weight: 650;
+  color: #fff4ee;
+}
+
+.msg-meta time,
+.msg-gutter time {
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.msg-body {
+  line-height: 1.45;
+}
+
+.msg-body code {
+  background: var(--input);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
+.msg-body pre {
+  background: var(--input);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.msg-body a {
+  color: #ffab70;
+}
+
+.mention {
+  background: var(--accent-soft);
+  color: #ffc49b;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+
+.msg-body.mentions-me,
+.msg:has(.mentions-me) {
+  background: rgba(255, 122, 51, 0.07);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.day-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 18px 16px 4px;
+  color: var(--faint);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.day-divider::before,
+.day-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.msg-tools {
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+.reaction {
+  background: var(--raised);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  transition: background-color 0.12s, border-color 0.12s;
+}
+
+.reaction.mine {
+  background: var(--accent-soft);
+  border-color: rgba(255, 122, 51, 0.5);
+}
+
+.att {
+  border-radius: 10px;
+}
+
+.pending-file,
+.att-file {
+  border: 1px solid var(--line);
+}
+
+/* ---- composer ---- */
+
+.composer-row {
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.composer-row:focus-within {
+  border-color: rgba(255, 122, 51, 0.6);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.composer-row textarea:focus {
+  box-shadow: none;
+}
+
+/* ---- buttons ---- */
+
+.btn {
+  border-radius: 8px;
+  transition: background-color 0.12s, filter 0.12s, transform 0.08s;
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn.primary {
+  background: var(--ember);
+  color: #fff;
+  text-shadow: 0 1px 0 rgba(0, 0, 0, 0.15);
+}
+
+.btn.primary:hover {
+  filter: brightness(1.08);
+}
+
+.tab.active {
+  background: var(--active);
+}
+
+.tab.add {
+  background: var(--ember);
+  color: #fff;
+}
+
+.tab.add.active {
+  background: transparent;
+  color: var(--accent);
+}
+
+/* ---- members ---- */
+
+#members {
+  border-left: 1px solid var(--line);
+}
+
+.member {
+  border-radius: 6px;
+  transition: background-color 0.12s;
+}
+
+.member .tag {
+  color: var(--accent);
+}
+
+.member-group {
+  margin: 16px 8px 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+/* ---- avatars & presence ---- */
+
+.avatar {
+  transition: box-shadow 0.12s;
+}
+
+.avatar.speaking {
+  box-shadow: 0 0 0 2px var(--side), 0 0 0 4px var(--green);
+}
+
+/* ---- call ---- */
+
+.call {
+  background: #0c0b0d;
+}
+
+.tile {
+  border-radius: 14px;
+  background: radial-gradient(120% 120% at 50% 35%, var(--tint, #2a262c) 0%, #141216 100%);
+  box-shadow: 0 0 0 1px var(--line);
+  contain: content;
+}
+
+.tile.speaking::after {
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 2px var(--green), inset 0 0 24px rgba(60, 207, 120, 0.22);
+}
+
+.tile .avatar.xl {
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.tile-label {
+  background: rgba(10, 9, 11, 0.72);
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.live-badge {
+  background: var(--red);
+  border-radius: 4px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.call-controls {
+  gap: 10px;
+}
+
+.ctl {
+  background: #252127;
+  border: 1px solid var(--line);
+  transition: background-color 0.12s, transform 0.1s var(--ease);
+}
+
+.ctl:hover {
+  background: #312c33;
+  transform: translateY(-1px);
+}
+
+.ctl.on {
+  background: var(--ember);
+  border-color: transparent;
+}
+
+.ctl.off {
+  background: #3b2224;
+  color: #ff8a8a;
+}
+
+.ctl.leave {
+  background: var(--red);
+  border-color: transparent;
+}
+
+/* ---- modals & toasts ---- */
+
+.backdrop {
+  background: rgba(6, 5, 7, 0.72);
+}
+
+.modal {
+  background: var(--main);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+.copybox {
+  border: 1px solid var(--line);
+}
+
+.toast {
+  background: #19161b;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+}
+
+.toast.error {
+  border-left-color: var(--red);
+}
+
+/* ---- empty states ---- */
+
+.empty {
+  text-align: center;
+}
+
+.empty-art {
+  font-size: 44px;
+  line-height: 1;
+  margin-bottom: 10px;
+  filter: saturate(1.1);
+}
+
+/* Entrances: a quick fade/rise for things that appear. */
+.modal,
+.toast,
+.emoji-picker {
+  animation: rise 0.16s var(--ease) both;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
+
+.btn.older {
+  display: block;
+  margin: 12px auto;
+  background: var(--raised);
+  font-size: 13px;
+}
+
+.composer-row textarea,
+.composer-row textarea:focus {
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.empty .btn {
+  margin-top: 12px;
+}

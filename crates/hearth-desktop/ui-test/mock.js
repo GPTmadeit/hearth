@@ -402,6 +402,18 @@ async function run() {
     await until("open_url", () => called("open_url").some((c) => c.args.url === "https://example.com/page"));
   });
 
+  await test("long channels draw only the latest messages", async () => {
+    const old = msg(BOB, DEN_GENERAL, "from last week", { sent_at_ms: Date.now() - 7 * 86_400_000 });
+    db.messages[DEN_GENERAL].unshift(old);
+    for (let i = 0; i < 160; i++) emit({ type: "message", server: DEN, message: msg(CAROL, DEN_GENERAL, `spam ${i}`) });
+    await until("last one drawn", () => lastMsgRow()?.textContent.includes("spam 159"));
+    const drawn = qa("#messages .msg").length;
+    if (drawn > 150) throw new Error(`${drawn} messages drawn`);
+    if (!q("#messages .day-divider")?.textContent.includes("Today")) throw new Error("no day divider");
+    q("[data-older]").click();
+    await until("older drawn", () => qa("#messages .msg").length > drawn);
+  });
+
   await test("messages elsewhere notify and mark unread", async () => {
     q('[data-new="false"]').click();
     await fillModal({ name: "memes" });
