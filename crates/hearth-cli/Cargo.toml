@@ -1,0 +1,11 @@
+[package]
+name = "hearth-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+hearth-core = { version = "0.1.0", path = "../hearth-core" }
+tokio = { version = "1.54.1", features = ["full"] }
