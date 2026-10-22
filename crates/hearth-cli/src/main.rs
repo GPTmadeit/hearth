@@ -196,11 +196,16 @@ fn render(m: &ChatMessage) -> String {
 }
 
 /// A frame whose bytes are derived from its number, so receivers can verify it.
-fn test_frame(n: u32, key: bool) -> Vec<u8> {
-    let mut f = Vec::with_capacity(TEST_FRAME);
+/// A synthetic camera frame: about what a real 720p camera sends (~1 Mbit/s at 30 fps).
+fn camera_frame_size(key: bool) -> usize {
+    if key { 20_000 } else { 4_000 }
+}
+
+fn test_frame(n: u32, key: bool, len: usize) -> Vec<u8> {
+    let mut f = Vec::with_capacity(len);
     f.push(key as u8);
     f.extend_from_slice(&n.to_be_bytes());
-    f.extend((0..TEST_FRAME - 5).map(|i| (i as u32).wrapping_mul(31).wrapping_add(n) as u8));
+    f.extend((0..len - 5).map(|i| (i as u32).wrapping_mul(31).wrapping_add(n) as u8));
     f
 }
 
@@ -217,7 +222,7 @@ fn video_test_receiver() -> Box<dyn Fn(hearth_core::MediaPacket) + Send> {
             return;
         }
         let n = u32::from_be_bytes(p.payload[1..5].try_into().expect("4 bytes"));
-        let ok = p.payload == test_frame(n, p.payload[0] == 1);
+        let ok = p.payload == test_frame(n, p.payload[0] == 1, p.payload.len());
         let mut all = state.lock().expect("video stats");
         let s = all.entry(p.kind).or_default();
         s.0 += 1;
@@ -501,7 +506,7 @@ impl Repl {
                     while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(33));
                         let key = n.is_multiple_of(60);
-                        sender.send_frame(&test_frame(n, key), key);
+                        sender.send_frame(&test_frame(n, key, TEST_FRAME), key);
                         n += 1;
                     }
                 });
@@ -602,7 +607,7 @@ impl Repl {
                         while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                             std::thread::sleep(std::time::Duration::from_millis(33));
                             let key = n.is_multiple_of(60);
-                            sender.send_camera(&test_frame(n, key), key);
+                            sender.send_camera(&test_frame(n, key, camera_frame_size(key)), key);
                             n += 1;
                         }
                     });
