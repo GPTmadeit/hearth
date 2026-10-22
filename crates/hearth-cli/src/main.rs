@@ -12,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 mod update;
 
 #[derive(Parser)]
-#[command(name = "hearth", about = "Peer-to-peer encrypted chat")]
+#[command(name = "hearth", version, about = "Peer-to-peer encrypted chat")]
 struct Cli {
     /// Where your identity and data live (defaults to the platform data dir).
     #[arg(long, global = true)]
