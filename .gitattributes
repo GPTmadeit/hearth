@@ -1,0 +1,2 @@
+# Signed fixtures must be byte-identical on every OS; never convert line endings.
+crates/hearth-cli/testdata/** binary
