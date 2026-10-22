@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -2241,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "hearth-media"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "cpal",
