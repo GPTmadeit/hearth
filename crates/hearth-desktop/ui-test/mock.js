@@ -58,6 +58,13 @@ const handlers = {
     window.__video = channel;
   },
   set_camera: () => null,
+  audio_devices: () => ({
+    inputs: [{ id: "pulseaudio:usb_mic", name: "USB Mic" }, { id: "pulseaudio:builtin_mic", name: "Built-in Mic" }],
+    outputs: [{ id: "pulseaudio:headset", name: "Headset" }],
+    input: null,
+    output: "pulseaudio:headset",
+  }),
+  set_audio_devices: () => [],
   set_live: () => null,
   watch: () => null,
   // Loop our camera back as Bob's, so the receive path (decode -> tile) is exercised too.
@@ -192,7 +199,16 @@ function fakeStream() {
   }, 33);
   return c.captureStream(30);
 }
-navigator.mediaDevices.getUserMedia = async () => fakeStream();
+const cameraRequests = [];
+navigator.mediaDevices.getUserMedia = async (c) => {
+  cameraRequests.push(c);
+  return fakeStream();
+};
+navigator.mediaDevices.enumerateDevices = async () => [
+  { kind: "videoinput", deviceId: "obs-virtual", label: "OBS Virtual Camera" },
+  { kind: "videoinput", deviceId: "webcam-1", label: "HD Webcam" },
+  { kind: "audioinput", deviceId: "x", label: "ignored: audio is native" },
+];
 navigator.mediaDevices.getDisplayMedia = async () => fakeStream();
 
 // ---- helpers ----
@@ -470,6 +486,29 @@ async function run() {
     } finally {
       VideoEncoder.isConfigSupported = orig;
     }
+  });
+
+  await test("pick mic, speakers and camera mid-call", async () => {
+    const cameraCalls = called("set_camera").length;
+    q('[data-ctl="devices"]').click();
+    await until("device modal", () => q('.modal [name="camera"]'));
+    const labels = (n) => [...q(`.modal [name="${n}"]`).options].map((o) => o.textContent);
+    if (!labels("camera").includes("HD Webcam") || !labels("camera").includes("OBS Virtual Camera")) throw new Error(`cameras: ${labels("camera")}`);
+    if (q('.modal [name="output"]').value !== "pulseaudio:headset") throw new Error("saved speakers not preselected");
+    if (!labels("input").includes("USB Mic")) throw new Error(`mics: ${labels("input")}`);
+    const before = cameraRequests.length;
+    await fillModal({ input: "pulseaudio:usb_mic", camera: "webcam-1" });
+    await until("audio switched", () => called("set_audio_devices").some((c) => c.args.input === "pulseaudio:usb_mic" && c.args.output === "pulseaudio:headset"));
+    await until("webcam opened", () => cameraRequests.slice(before).some((c) => c.video?.deviceId?.exact === "webcam-1"));
+    await until("still sending", () => q(`.tile[data-peer="${ME}"] video.mirror`));
+    if (called("set_camera").length !== cameraCalls) throw new Error("camera blinked off for others while switching");
+    if (JSON.parse(localStorage.getItem("hearth.settings")).camera !== "webcam-1") throw new Error("camera choice not saved");
+    // The next time the camera starts, it's the chosen one.
+    q('[data-ctl="camera"]').click();
+    await until("camera off", () => called("set_camera").length > cameraCalls);
+    const again = cameraRequests.length;
+    q('[data-ctl="camera"]').click();
+    await until("reopened chosen", () => cameraRequests.slice(again).some((c) => c.video?.deviceId?.exact === "webcam-1"));
   });
 
   await test("focus a tile", async () => {

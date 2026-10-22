@@ -10,7 +10,7 @@ use hearth_core::{
     Attachment, BlobRef, Change, ChannelKind, ChatMessage, Config, EventId, FriendState, Hearth, MediaSender, PeerId,
     ServerId, ServerSummary, Update, identity,
 };
-use hearth_media::{Audio, AudioOptions};
+use hearth_media::{Audio, AudioOptions, Devices};
 use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, State,
@@ -248,6 +248,11 @@ fn to_dto(u: Update, me: PeerId) -> UpdateDto {
 #[derive(Serialize, Deserialize, Default)]
 struct Settings {
     name: Option<String>,
+    /// Chosen microphone and speakers (cpal device ids); unset means the system default.
+    #[serde(default)]
+    input_device: Option<String>,
+    #[serde(default)]
+    output_device: Option<String>,
 }
 
 struct App {
@@ -270,6 +275,15 @@ fn load_settings(dir: &std::path::Path) -> Settings {
     std::fs::read(dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
+fn save_settings(dir: &std::path::Path, settings: &Settings) -> Res<()> {
+    std::fs::write(dir.join("settings.json"), serde_json::to_vec_pretty(settings).map_err(err)?).map_err(err)
+}
+
+fn chosen_devices(dir: &std::path::Path) -> Devices {
+    let s = load_settings(dir);
+    Devices { input: s.input_device, output: s.output_device }
+}
+
 // ---- commands: identity & servers ----
 
 #[derive(Serialize)]
@@ -289,9 +303,8 @@ async fn set_name(app: State<'_, App>, name: String) -> Res<()> {
     if name.is_empty() {
         return Err("name can't be empty".into());
     }
-    let settings = Settings { name: Some(name.clone()) };
-    std::fs::write(app.data_dir.join("settings.json"), serde_json::to_vec_pretty(&settings).map_err(err)?)
-        .map_err(err)?;
+    let settings = Settings { name: Some(name.clone()), ..load_settings(&app.data_dir) };
+    save_settings(&app.data_dir, &settings)?;
     *app.name.lock().unwrap() = name.clone();
     app.hearth.set_name(name).await.map_err(err)
 }
@@ -580,6 +593,7 @@ async fn voice_join(app: State<'_, App>, server: String, channel: String) -> Res
                 let _ = ch.send(InvokeResponseBody::Raw(buf));
             }
         })),
+        devices: chosen_devices(&app.data_dir),
         ..Default::default()
     };
     match Audio::start(session, opts) {
@@ -602,6 +616,41 @@ async fn voice_leave(app: State<'_, App>) -> Res<()> {
     *app.video_out.lock().unwrap() = None;
     *app.speaking.lock().unwrap() = false;
     app.hearth.voice_leave().await.map_err(err)
+}
+
+#[derive(Serialize)]
+struct AudioDevice {
+    id: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct AudioDevices {
+    inputs: Vec<AudioDevice>,
+    outputs: Vec<AudioDevice>,
+    input: Option<String>,
+    output: Option<String>,
+}
+
+/// Microphones and speakers, and which ones are chosen.
+#[tauri::command]
+async fn audio_devices(app: State<'_, App>) -> Res<AudioDevices> {
+    let (inputs, outputs) =
+        tauri::async_runtime::spawn_blocking(hearth_media::list_devices).await.map_err(err)?.map_err(err)?;
+    let dto = |v: Vec<hearth_media::DeviceInfo>| v.into_iter().map(|d| AudioDevice { id: d.id, name: d.name }).collect();
+    let chosen = chosen_devices(&app.data_dir);
+    Ok(AudioDevices { inputs: dto(inputs), outputs: dto(outputs), input: chosen.input, output: chosen.output })
+}
+
+/// Saves the device choice and, mid-call, switches to it. Returns warnings.
+#[tauri::command]
+async fn set_audio_devices(app: State<'_, App>, input: Option<String>, output: Option<String>) -> Res<Vec<String>> {
+    let settings = Settings { input_device: input.clone(), output_device: output.clone(), ..load_settings(&app.data_dir) };
+    save_settings(&app.data_dir, &settings)?;
+    match app.audio.lock().unwrap().as_ref() {
+        Some(a) => a.set_devices(Devices { input, output }).map_err(|e| format!("couldn't switch: {e:#}")),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Mutes/deafens our audio and shows it to everyone in the call.
@@ -824,6 +873,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             me,
             set_name,
+            audio_devices,
+            set_audio_devices,
             servers,
             names,
             online,

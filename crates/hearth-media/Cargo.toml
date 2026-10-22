@@ -1,6 +1,6 @@
 [package]
 name = "hearth-media"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GPTmadeit/hearth"
@@ -11,3 +11,8 @@ cpal = "0.18.2"
 hearth-core = { path = "../hearth-core" }
 hound = "3.5.1"
 opus = "0.4.0"
+
+# PulseAudio (and PipeWire's pulse server) names devices the way the desktop
+# does; plain ALSA lists every PCM plugin. cpal falls back to ALSA without it.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"] }

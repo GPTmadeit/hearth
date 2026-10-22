@@ -190,7 +190,7 @@ function modal({ title, body = "", fields = [], submit = "OK", onSubmit, extra =
             f.type === "checkbox"
               ? `<label class="check"><input type="checkbox" name="${f.name}" ${f.value ? "checked" : ""}> ${esc(f.label)}</label>`
               : f.type === "select"
-                ? `<label for="f-${f.name}">${esc(f.label)}</label><select id="f-${f.name}" name="${f.name}">${f.options.map(([v, l]) => `<option value="${v}" ${v === f.value ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`
+                ? `<label for="f-${f.name}">${esc(f.label)}</label><select id="f-${f.name}" name="${f.name}">${f.options.map(([v, l]) => `<option value="${esc(v)}" ${v === f.value ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`
                 : `<label for="f-${f.name}">${esc(f.label)}</label><input id="f-${f.name}" name="${f.name}" value="${esc(f.value || "")}" placeholder="${esc(f.placeholder || "")}" autocomplete="off">`,
           )
           .join("")}
@@ -1579,7 +1579,8 @@ function settingsModal() {
         ${state.avatars[state.me.id] ? `<button type="button" class="btn" id="avatar-clear">Remove</button>` : ""}
         <input type="file" id="avatar-file" accept="image/*" hidden></div>
       </div>
-      <label>Your peer ID</label>${idBox(state.me.id)}<p style="margin-top:8px">Share this so people can add you. Your private key never leaves this device.</p>`,
+      <label>Your peer ID</label>${idBox(state.me.id)}<p style="margin-top:8px">Share this so people can add you. Your private key never leaves this device.</p>
+      <button type="button" class="btn" id="devices-btn">🎙 Microphone, speakers & camera…</button>`,
     fields: [
       { name: "name", label: "Display name", value: state.me.name },
       { name: "dnd", type: "checkbox", label: "Do not disturb (no notifications or sounds)", value: state.settings.dnd },
@@ -1597,6 +1598,7 @@ function settingsModal() {
       renderUser();
     },
   });
+  $("#devices-btn", root).onclick = devicesModal;
   $("#avatar-pick", root).onclick = () => $("#avatar-file", root).click();
   $("#avatar-file", root).onchange = async (e) => {
     const f = e.target.files[0];
@@ -1628,6 +1630,56 @@ async function resizeImage(file, size) {
 }
 
 // ---------- voice ----------
+
+/** Picks the microphone, speakers and camera. Works mid-call. */
+async function devicesModal() {
+  const audio = await invoke("audio_devices").catch((e) => {
+    toast(`Couldn't list audio devices: ${e}`, { error: true });
+    return { inputs: [], outputs: [], input: null, output: null };
+  });
+  const cameras = await listCameras();
+  const opts = (list, unnamed) => [["", "System default"], ...list.map((d, i) => [d.id, d.name || `${unnamed} ${i + 1}`])];
+  // A saved device that's unplugged still shows, so saving doesn't silently forget it.
+  const keep = (list, id, what) => (id && !list.some((d) => d.id === id) ? [...list, { id, name: `${what} (not connected)` }] : list);
+  const camId = state.settings.camera || "";
+  modal({
+    title: "Voice & video",
+    fields: [
+      { name: "input", type: "select", label: "Microphone", value: audio.input || "", options: opts(keep(audio.inputs, audio.input, "Microphone"), "Microphone") },
+      { name: "output", type: "select", label: "Speakers / headphones", value: audio.output || "", options: opts(keep(audio.outputs, audio.output, "Speakers"), "Speakers") },
+      { name: "camera", type: "select", label: "Camera", value: camId, options: opts(keep(cameras.map((c) => ({ id: c.deviceId, name: c.label })), camId, "Camera"), "Camera") },
+    ],
+    submit: "Save",
+    onSubmit: async ({ input, output, camera }) => {
+      if ((input || null) !== audio.input || (output || null) !== audio.output) {
+        const warnings = await call("set_audio_devices", { input: input || null, output: output || null });
+        for (const w of warnings) toast(w, { error: true, timeout: 8000 });
+      }
+      if (camera !== camId) {
+        state.settings.camera = camera || null;
+        saveSettings();
+        await switchCamera();
+      }
+    },
+  });
+}
+
+/** Cameras, with names. Browsers hide the names until camera access is granted once. */
+async function listCameras() {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+  const list = async () => (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+  let cams = await list().catch(() => []);
+  if (cams.length && cams.some((c) => !c.label)) {
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      s.getTracks().forEach((t) => t.stop());
+      cams = await list();
+    } catch {
+      /* no permission: unnamed cameras are still selectable */
+    }
+  }
+  return cams;
+}
 
 async function joinVoice(serverId, channel) {
   if (state.inVoice?.channel === channel) return;
@@ -1836,16 +1888,49 @@ async function startCamera() {
   }
   let stream;
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, audio: false });
+    stream = await openCamera();
   } catch (e) {
     toast(`Couldn't open your camera: ${e.message || e.name}`, { error: true });
     return;
   }
+  state.camera = await cameraFrom(stream);
+  await call("set_camera", { on: true });
+  renderCall();
+}
+
+/** Opens the chosen camera, falling back to the default if it's gone. */
+async function openCamera() {
+  const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+  const want = state.settings.camera;
+  if (!want) return navigator.mediaDevices.getUserMedia({ video, audio: false });
+  try {
+    return await navigator.mediaDevices.getUserMedia({ video: { ...video, deviceId: { exact: want } }, audio: false });
+  } catch (e) {
+    if (!["OverconstrainedError", "NotFoundError"].includes(e.name)) throw e;
+    toast("Your chosen camera isn't connected; using the default.", { error: true });
+    return navigator.mediaDevices.getUserMedia({ video, audio: false });
+  }
+}
+
+async function cameraFrom(stream) {
   const track = stream.getVideoTracks()[0];
   const enc = await startEncoder(track, CAMERA);
   track.onended = () => stopCamera();
-  state.camera = { ...enc, preview: previewVideo(stream, true) };
-  await call("set_camera", { on: true });
+  return { ...enc, preview: previewVideo(stream, true) };
+}
+
+/** Moves a live camera to the newly chosen device without turning it off for others. */
+async function switchCamera() {
+  if (!state.camera) return;
+  let stream;
+  try {
+    stream = await openCamera();
+  } catch (e) {
+    toast(`Couldn't open that camera: ${e.message || e.name}`, { error: true });
+    return;
+  }
+  state.camera.stop();
+  state.camera = await cameraFrom(stream);
   renderCall();
 }
 
@@ -2055,6 +2140,7 @@ function renderCall() {
       <button class="ctl${state.deafened ? " off" : ""}" data-ctl="deafen" title="${state.deafened ? "Undeafen" : "Deafen"}">${state.deafened ? "🔕" : "🎧"}</button>
       <button class="ctl${state.camera ? " on" : ""}" data-ctl="camera" title="${state.camera ? "Turn off camera" : "Turn on camera"}">📷</button>
       ${navigator.mediaDevices?.getDisplayMedia ? `<button class="ctl${state.sharing ? " on" : ""}" data-ctl="share" title="${state.sharing ? "Stop sharing" : "Share your screen"}">🖥</button>` : ""}
+      <button class="ctl" data-ctl="devices" title="Microphone, speakers & camera">⚙</button>
       <button class="ctl leave" data-ctl="leave" title="Leave call">📞</button>`;
   } else {
     bar.innerHTML = `<button class="btn join-call" data-ctl="join">Join call</button>`;
@@ -2071,6 +2157,7 @@ function renderCall() {
         if (c === "deafen") setMute(state.muted, !state.deafened);
         if (c === "camera") (state.camera ? stopCamera() : startCamera());
         if (c === "share") (state.sharing ? stopShare() : startShare());
+        if (c === "devices") devicesModal();
         if (c === "leave") leaveVoice();
         if (c === "join") joinVoice(shown.server, shown.channel);
       }),

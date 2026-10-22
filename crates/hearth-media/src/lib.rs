@@ -43,9 +43,43 @@ pub enum Output {
     Wav(PathBuf),
 }
 
+/// An audio device as the system names it. `id` is stable across runs, so it's what to save.
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+}
+
+/// Which microphone and speakers to use; `None` means the system default.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Devices {
+    pub input: Option<String>,
+    pub output: Option<String>,
+}
+
+/// The microphones and speakers on this machine.
+pub fn list_devices() -> Result<(Vec<DeviceInfo>, Vec<DeviceInfo>)> {
+    let host = cpal::default_host();
+    let info = |d: cpal::Device| {
+        let id = d.id().ok()?.to_string();
+        let name = d.description().map(|x| x.name().to_string()).unwrap_or_else(|_| id.clone());
+        Some(DeviceInfo { id, name })
+    };
+    // PulseAudio offers every output's "monitor" as a microphone; nobody wants those here.
+    let inputs = host
+        .input_devices()
+        .context("listing microphones")?
+        .filter_map(info)
+        .filter(|d: &DeviceInfo| !d.id.ends_with(".monitor"))
+        .collect();
+    let outputs = host.output_devices().context("listing speakers")?.filter_map(info).collect();
+    Ok((inputs, outputs))
+}
+
 pub struct AudioOptions {
     pub input: Input,
     pub output: Output,
+    pub devices: Devices,
     /// Frames quieter than this (dBFS) aren't sent.
     pub gate_db: f32,
     /// Receives non-audio media (screen-share video) arriving on the session.
@@ -54,7 +88,7 @@ pub struct AudioOptions {
 
 impl Default for AudioOptions {
     fn default() -> Self {
-        Self { input: Input::Microphone, output: Output::Speakers, gate_db: -50.0, on_media: None }
+        Self { input: Input::Microphone, output: Output::Speakers, devices: Devices::default(), gate_db: -50.0, on_media: None }
     }
 }
 
@@ -74,6 +108,9 @@ impl Controls {
     }
 }
 
+/// A device change for the device thread, and where to send its warnings or error.
+type Switch = (Devices, mpsc::Sender<Result<Vec<String>, String>>);
+
 /// A running voice connection. Dropping it stops all audio.
 pub struct Audio {
     pub controls: Arc<Controls>,
@@ -83,6 +120,8 @@ pub struct Audio {
     mixer: Arc<Mutex<Mixer>>,
     stop: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
+    /// Asks the device thread to switch devices; absent when not using devices.
+    switch: Option<mpsc::Sender<Switch>>,
 }
 
 impl Audio {
@@ -98,22 +137,41 @@ impl Audio {
 
         // Device streams aren't Send on every platform, so one thread owns them.
         let needs_devices = matches!(opts.input, Input::Microphone) || matches!(opts.output, Output::Speakers);
+        let mut switch = None;
         if needs_devices {
             let (ready_tx, ready_rx) = mpsc::channel();
+            let (switch_tx, switch_rx) = mpsc::channel::<Switch>();
             let (mic, speakers) = (matches!(opts.input, Input::Microphone), matches!(opts.output, Output::Speakers));
             let (captured, mixer, stop) = (captured.clone(), mixer.clone(), stop.clone());
+            let mut current = opts.devices;
             threads.push(thread::Builder::new().name("hearth-audio-io".into()).spawn(move || {
-                let streams = open_devices(mic, speakers, captured, mixer);
+                let open = |d: &Devices| open_devices(mic, speakers, d, captured.clone(), mixer.clone());
+                let mut streams = open(&current);
                 let ok = streams.is_ok();
                 let _ = ready_tx.send(streams.as_ref().map(|s| s.2.clone()).map_err(|e| format!("{e:#}")));
-                if ok {
-                    while !stop.load(Ordering::Relaxed) {
-                        thread::sleep(Duration::from_millis(50));
-                    }
+                if !ok {
+                    return;
+                }
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok((want, reply)) = switch_rx.recv_timeout(Duration::from_millis(50)) else { continue };
+                    // Close first: some drivers won't open a device that's already open.
+                    drop(streams);
+                    streams = match open(&want) {
+                        Ok(s) => {
+                            current = want;
+                            let _ = reply.send(Ok(s.2.clone()));
+                            Ok(s)
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(format!("{e:#}")));
+                            open(&current)
+                        }
+                    };
                 }
                 drop(streams);
             })?);
             warnings = ready_rx.recv().context("audio thread died")?.map_err(|e| anyhow!(e))?;
+            switch = Some(switch_tx);
         }
 
         // Encoder: pulls 20 ms frames (from the mic buffer or a tone) and sends them.
@@ -159,7 +217,16 @@ impl Audio {
             })?);
         }
 
-        Ok(Self { controls, sender, warnings, mixer, stop, threads })
+        Ok(Self { controls, sender, warnings, mixer, stop, threads, switch })
+    }
+
+    /// Moves to other devices without leaving the call. Returns non-fatal
+    /// warnings; on error the previous devices stay in use.
+    pub fn set_devices(&self, devices: Devices) -> Result<Vec<String>> {
+        let Some(switch) = &self.switch else { return Ok(Vec::new()) };
+        let (tx, rx) = mpsc::channel();
+        switch.send((devices, tx)).map_err(|_| anyhow!("audio thread stopped"))?;
+        rx.recv_timeout(Duration::from_secs(10)).context("audio thread didn't answer")?.map_err(|e| anyhow!(e))
     }
 
     /// For sending other media (screen share) into the same voice session.
@@ -391,23 +458,47 @@ impl Resampler {
 
 type Streams = (Option<cpal::Stream>, Option<cpal::Stream>, Vec<String>);
 
-fn open_devices(mic: bool, speakers: bool, captured: Arc<Mutex<VecDeque<f32>>>, mixer: Arc<Mutex<Mixer>>) -> Result<Streams> {
+fn open_devices(
+    mic: bool,
+    speakers: bool,
+    devices: &Devices,
+    captured: Arc<Mutex<VecDeque<f32>>>,
+    mixer: Arc<Mutex<Mixer>>,
+) -> Result<Streams> {
     let host = cpal::default_host();
     let mut warnings = Vec::new();
     // Without a usable microphone you can still listen, like joining muted.
-    let input = match mic.then(|| open_mic(&host, captured)).transpose() {
+    let input = match mic.then(|| open_mic(&host, devices.input.as_deref(), &mut warnings, captured)).transpose() {
         Ok(s) => s,
         Err(e) => {
             warnings.push(format!("listening only: {e:#}"));
             None
         }
     };
-    let output = if speakers { Some(open_speakers(&host, mixer)?) } else { None };
+    let output =
+        if speakers { Some(open_speakers(&host, devices.output.as_deref(), &mut warnings, mixer)?) } else { None };
     Ok((input, output, warnings))
 }
 
-fn open_mic(host: &cpal::Host, captured: Arc<Mutex<VecDeque<f32>>>) -> Result<cpal::Stream> {
-    let dev = host.default_input_device().context("no microphone found")?;
+/// The chosen device, or the default one if it's gone (e.g. unplugged).
+fn pick(host: &cpal::Host, id: Option<&str>, input: bool, warnings: &mut Vec<String>) -> Option<cpal::Device> {
+    if let Some(id) = id {
+        if let Some(d) = id.parse::<cpal::DeviceId>().ok().and_then(|id| host.device_by_id(&id)) {
+            return Some(d);
+        }
+        let what = if input { "microphone" } else { "speakers" };
+        warnings.push(format!("your chosen {what} isn't connected; using the default"));
+    }
+    if input { host.default_input_device() } else { host.default_output_device() }
+}
+
+fn open_mic(
+    host: &cpal::Host,
+    id: Option<&str>,
+    warnings: &mut Vec<String>,
+    captured: Arc<Mutex<VecDeque<f32>>>,
+) -> Result<cpal::Stream> {
+    let dev = pick(host, id, true, warnings).context("no microphone found")?;
     let cfg = dev.default_input_config().context("microphone")?;
     let s = match cfg.sample_format() {
         SampleFormat::F32 => build_input::<f32>(&dev, cfg.into(), captured),
@@ -420,8 +511,13 @@ fn open_mic(host: &cpal::Host, captured: Arc<Mutex<VecDeque<f32>>>) -> Result<cp
     Ok(s)
 }
 
-fn open_speakers(host: &cpal::Host, mixer: Arc<Mutex<Mixer>>) -> Result<cpal::Stream> {
-    let dev = host.default_output_device().context("no speakers found")?;
+fn open_speakers(
+    host: &cpal::Host,
+    id: Option<&str>,
+    warnings: &mut Vec<String>,
+    mixer: Arc<Mutex<Mixer>>,
+) -> Result<cpal::Stream> {
+    let dev = pick(host, id, false, warnings).context("no speakers found")?;
     let cfg = dev.default_output_config().context("speakers")?;
     let s = match cfg.sample_format() {
         SampleFormat::F32 => build_output::<f32>(&dev, cfg.into(), mixer),

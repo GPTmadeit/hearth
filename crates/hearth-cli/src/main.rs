@@ -6,7 +6,7 @@ use hearth_core::{
     Attachment, Change, ChannelKind, ChatMessage, Config, EventId, FriendState, Hearth, HostPolicy, PeerId, RelayUrl,
     ServerId, ServerSummary, Update, identity,
 };
-use hearth_media::{Audio, AudioOptions, Input, Output};
+use hearth_media::{Audio, AudioOptions, Devices, Input, Output};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod update;
@@ -74,6 +74,7 @@ commands:
   /voice [channel]         join voice           /leave               leave voice
   /mute  /deafen           toggle mic/sound      /live  /unlive       stream (--video-test)
   /cam  /nocam             camera (--video-test)
+  /devices                 list mics/speakers    /mic <n>  /speakers <n>  pick one (0 = default)
   /watch <peer>            watch a stream        /peers               who's online
   /friend <peer>           add/accept friend     /friends             friends & requests
   /unfriend <peer>         remove/decline        /dm <friend> <text>  direct message
@@ -238,11 +239,12 @@ struct Repl {
     video_test: bool,
     streaming: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     camera: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    devices: Devices,
 }
 
 impl Repl {
     fn new(hearth: Hearth) -> Self {
-        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None, video_test: false, streaming: None, camera: None }
+        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None, video_test: false, streaming: None, camera: None, devices: Devices::default() }
     }
 
     async fn run(mut self, mut updates: tokio::sync::mpsc::UnboundedReceiver<Update>, peers: Vec<PeerId>) -> Result<()> {
@@ -448,6 +450,7 @@ impl Repl {
                     input: self.tone.map_or(Input::Microphone, |hz| Input::Tone { hz }),
                     output: self.record.clone().map_or(Output::Speakers, Output::Wav),
                     on_media: self.video_test.then(video_test_receiver),
+                    devices: self.devices.clone(),
                     ..Default::default()
                 };
                 match Audio::start(session, opts) {
@@ -504,6 +507,37 @@ impl Repl {
                 self.audio = None;
                 self.hearth.voice_leave().await?;
                 println!("left voice");
+            }
+            "/devices" => {
+                let (inputs, outputs) = hearth_media::list_devices()?;
+                for (title, list, chosen) in
+                    [("microphones", inputs, &self.devices.input), ("speakers", outputs, &self.devices.output)]
+                {
+                    println!("{title}:");
+                    println!("  {} 0. system default", if chosen.is_none() { "*" } else { " " });
+                    for (i, d) in list.iter().enumerate() {
+                        let mark = if chosen.as_ref() == Some(&d.id) { "*" } else { " " };
+                        println!("  {mark} {}. {}", i + 1, d.name);
+                    }
+                }
+            }
+            "/mic" | "/speakers" => {
+                let n: usize = rest.parse().context("which one? see /devices")?;
+                let (inputs, outputs) = hearth_media::list_devices()?;
+                let list = if cmd == "/mic" { inputs } else { outputs };
+                let pick = match n {
+                    0 => None,
+                    n => Some(list.get(n - 1).context("no such device; see /devices")?.id.clone()),
+                };
+                let mut want = self.devices.clone();
+                *(if cmd == "/mic" { &mut want.input } else { &mut want.output }) = pick;
+                if let Some(a) = &self.audio {
+                    for w in a.set_devices(want.clone())? {
+                        println!("! {w}");
+                    }
+                }
+                self.devices = want;
+                println!("ok");
             }
             "/mute" | "/deafen" => {
                 use std::sync::atomic::Ordering::Relaxed;

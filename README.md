@@ -29,6 +29,10 @@ that never leaves your device.
   control bar. DM calls sit above the conversation.
 - **Cameras**: up to 720p30, seen by everyone in the call. You see your own
   camera and your own screen share.
+- **Device choice**: pick your microphone, speakers/headphones and camera
+  (⚙ in the call bar, or in settings), including mid-call. Choices are
+  remembered; if a chosen device is unplugged, the system default is used.
+  In the CLI: `/devices`, `/mic <n>`, `/speakers <n>`.
 - **Voice**: Opus at 64 kbps with forward error correction over QUIC datagrams,
   with a jitter buffer and loss concealment. Mute and deafen. Speaking rings
   show for everyone in the server, not just people in the call. If there's no
