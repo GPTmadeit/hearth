@@ -26,6 +26,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release -p hearth-cli
+      - name: End-to-end over the real network
+        run: python3 scripts/e2e.py target/release/hearth
       - uses: actions/upload-artifact@v4
         with:
           name: hearth-cli-linux
@@ -43,6 +45,8 @@ jobs:
         run: cargo test --workspace
       - name: CLI and node
         run: cargo build --release -p hearth-cli
+      - name: End-to-end over the real network
+        run: python scripts/e2e.py target/release/hearth.exe
       - name: Desktop installers
         working-directory: crates/hearth-desktop
         run: cargo tauri build
