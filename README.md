@@ -122,3 +122,7 @@ cargo test --workspace
 
 The CLI accepts `--tone <hz>` and `--record <file.wav>`, which make voice
 testable without a microphone.
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.

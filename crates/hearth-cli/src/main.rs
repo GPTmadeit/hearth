@@ -145,7 +145,7 @@ fn video_test_receiver() -> Box<dyn Fn(hearth_core::MediaPacket) + Send> {
         if !ok {
             s.1 += 1;
         }
-        if s.0 % 30 == 0 {
+        if s.0.is_multiple_of(30) {
             println!("[video] {} frames from {} ({} KB each), {} corrupt", s.0, p.from.fmt_short(), p.payload.len() / 1000, s.1);
         }
     })
@@ -399,7 +399,7 @@ impl Repl {
                     let mut tick = tokio::time::interval(std::time::Duration::from_millis(33));
                     while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                         tick.tick().await;
-                        let key = n % 60 == 0;
+                        let key = n.is_multiple_of(60);
                         sender.send_frame(&test_frame(n, key), key);
                         n += 1;
                     }
