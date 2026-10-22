@@ -100,12 +100,30 @@ pub enum ChannelKind {
     Voice,
 }
 
-/// What a sealed event decrypts to.
+/// A file attached to a message. The key decrypts the blob; see [`crate::blob`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub mime: String,
+    pub blob: crate::blob::BlobRef,
+}
+
+/// What a sealed event decrypts to. Append new variants only: older peers
+/// replicate events they can't decode and simply don't display them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Content {
     Rename { name: String },
     CreateChannel { name: String, kind: ChannelKind },
+    /// 0.1 messages: text only.
     Message { channel: EventId, body: String, sent_at_ms: u64 },
+    Post { channel: EventId, body: String, sent_at_ms: u64, reply_to: Option<EventId>, attachments: Vec<Attachment> },
+    /// Replaces a message's text. Only its author may edit.
+    Edit { target: EventId, body: String },
+    /// Hides a message. Its author or the server owner may delete.
+    Delete { target: EventId },
+    React { target: EventId, emoji: String, on: bool },
+    /// The author asks to leave; the owner's client removes them and rotates the key.
+    Leave,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

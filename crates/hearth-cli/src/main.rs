@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use hearth_core::{
-    Change, ChannelKind, Config, EventId, Hearth, HostPolicy, PeerId, RelayUrl, ServerId, ServerSummary, Update,
-    identity,
+    Attachment, Change, ChannelKind, ChatMessage, Config, EventId, FriendState, Hearth, HostPolicy, PeerId, RelayUrl,
+    ServerId, ServerSummary, Update, identity,
 };
 use hearth_media::{Audio, AudioOptions, Input, Output};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -72,9 +72,12 @@ commands:
   /invites                 pending invites       /accept <n>          join an invite
   /host <node>             add a storage node    /unhost <node>       remove it
   /voice [channel]         join voice           /leave               leave voice
-  /mute  /deafen           toggle mic/sound      /dm <peer> <text>    direct message
-  /live  /unlive           stream (--video-test) /watch <peer>        watch a stream
-  /peers                   who's online
+  /mute  /deafen           toggle mic/sound      /live  /unlive       stream (--video-test)
+  /watch <peer>            watch a stream        /peers               who's online
+  /friend <peer>           add/accept friend     /friends             friends & requests
+  /unfriend <peer>         remove/decline        /dm <friend> <text>  direct message
+  /attach <file> [text]    send a file           /save <dir>          save last attachments
+  /react <emoji>           react to last msg     /leaveserver         leave current server
   /history [n]             recent messages       /id                  your peer id
   /quit
 anything else is sent to the current channel. <peer> can be an id prefix or a name.";
@@ -176,6 +179,18 @@ async fn run_node(cfg: Config, auto_update: bool) -> Result<()> {
 
 const TEST_FRAME: usize = 50_000;
 
+/// A message's text plus a note for each attachment.
+fn render(m: &ChatMessage) -> String {
+    let mut out = m.body.clone();
+    for a in &m.attachments {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&format!("[file {} ({} KB)]", a.name, a.blob.size / 1024));
+    }
+    out
+}
+
 /// A frame whose bytes are derived from its number, so receivers can verify it.
 fn test_frame(n: u32, key: bool) -> Vec<u8> {
     let mut f = Vec::with_capacity(TEST_FRAME);
@@ -230,7 +245,7 @@ impl Repl {
         for p in peers {
             self.hearth.dial(p).await?;
         }
-        if let Some(s) = self.hearth.servers().await?.first() {
+        if let Some(s) = self.hearth.servers().await?.iter().find(|s| s.dm.is_none()) {
             self.select(s, None);
         }
 
@@ -320,7 +335,8 @@ impl Repl {
             "/servers" => {
                 for (i, s) in self.hearth.servers().await?.iter().enumerate() {
                     let mark = if self.current.is_some_and(|c| c.0 == s.id) { "*" } else { " " };
-                    let name = s.name.as_deref().unwrap_or("(syncing...)");
+                    let dm = s.dm.map(|p| format!("dm with {}", self.who(&p)));
+                    let name = dm.as_deref().or(s.name.as_deref()).unwrap_or("(syncing...)");
                     println!("{mark}{i}: {name}  [{} members, {}]", s.members.len(), s.id.short());
                 }
             }
@@ -489,9 +505,65 @@ impl Repl {
                 println!("{} {}", &cmd[1..], if on { "on" } else { "off" });
             }
             "/dm" => {
-                let (who, text) = rest.split_once(' ').context("usage: /dm <peer> <text>")?;
+                let (who, text) = rest.split_once(' ').context("usage: /dm <friend> <text>")?;
                 let peer = self.resolve_peer(who).await?;
-                self.hearth.dm(peer, text.to_string()).await?;
+                let dm = self.hearth.servers().await?.into_iter().find(|s| s.dm == Some(peer));
+                match dm.as_ref().and_then(|s| s.channels.iter().find(|c| c.kind == ChannelKind::Text).map(|c| (s.id, c.id))) {
+                    Some((server, channel)) => {
+                        self.hearth.post(server, channel, text.to_string(), None, Vec::new()).await?;
+                    }
+                    // Not friends (yet): a live-only message.
+                    None => self.hearth.dm(peer, text.to_string()).await?,
+                }
+            }
+            "/friend" => {
+                let peer = self.resolve_peer(rest).await?;
+                self.hearth.add_friend(peer).await?;
+                println!("friend request sent to {}", self.who(&peer));
+            }
+            "/unfriend" => {
+                let peer = self.resolve_peer(rest).await?;
+                self.hearth.remove_friend(peer).await?;
+            }
+            "/friends" => {
+                for f in self.hearth.friends().await? {
+                    let dot = if f.online { "●" } else { "○" };
+                    println!("  {dot} {}  {:?}{}", self.who(&f.peer), f.state, if f.dm.is_some() { "  (dm)" } else { "" });
+                }
+            }
+            "/attach" => {
+                let (server, channel) = self.current.context("no channel selected")?;
+                let (path, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+                let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let blob = self.hearth.upload(&bytes)?;
+                let attachment = Attachment { name, mime: "application/octet-stream".into(), blob };
+                self.hearth.post(server, channel, text.to_string(), None, vec![attachment]).await?;
+                println!("sent {path} ({} bytes)", bytes.len());
+            }
+            "/save" => {
+                let (server, channel) = self.current.context("no channel selected")?;
+                let history = self.hearth.history(server, channel, 500).await?;
+                let m = history.iter().rev().find(|m| !m.attachments.is_empty()).context("no attachments here")?;
+                std::fs::create_dir_all(rest)?;
+                for a in &m.attachments {
+                    let bytes = self.hearth.fetch(a.blob, vec![m.author]).await?;
+                    let path = std::path::Path::new(rest).join(&a.name);
+                    std::fs::write(&path, &bytes)?;
+                    println!("saved {} ({} bytes)", path.display(), bytes.len());
+                }
+            }
+            "/react" => {
+                let (server, channel) = self.current.context("no channel selected")?;
+                let history = self.hearth.history(server, channel, 1).await?;
+                let m = history.last().context("nothing to react to")?;
+                self.hearth.react(server, m.id, rest.to_string(), true).await?;
+            }
+            "/leaveserver" => {
+                let s = self.current_server().await?;
+                self.hearth.leave_server(s.id).await?;
+                self.current = None;
+                println!("left {}", s.name.as_deref().unwrap_or("server"));
             }
             "/peers" => {
                 for (p, name) in self.hearth.online_peers().await? {
@@ -502,7 +574,7 @@ impl Repl {
                 let (server, channel) = self.current.context("no channel selected")?;
                 let n = if rest.is_empty() { 20 } else { rest.parse()? };
                 for m in self.hearth.history(server, channel, n).await? {
-                    println!("<{}> {}", self.who(&m.author), m.body);
+                    println!("<{}> {}", self.who(&m.author), render(&m));
                 }
             }
             _ => bail!("unknown command {cmd} (/help)"),
@@ -525,7 +597,29 @@ impl Repl {
                 }
             }
             Update::Server { server, change } => self.server_change(server, change).await,
-            Update::KeyframeRequested => {}
+            Update::KeyframeRequested | Update::Typing { .. } | Update::Speaking { .. } => {}
+            Update::Friend { peer, request } => {
+                let state = self.hearth.friends().await.ok().and_then(|v| v.into_iter().find(|f| f.peer == peer));
+                match state.map(|f| (f.state, f.dm.is_some())) {
+                    Some((FriendState::Incoming, _)) if request => {
+                        println!("* {} sent you a friend request. /friend {} to accept", self.who(&peer), self.who(&peer))
+                    }
+                    Some((FriendState::Friends, true)) => println!("* you and {} are friends (dm ready)", self.who(&peer)),
+                    Some((FriendState::Friends, false)) => println!("* you and {} are friends", self.who(&peer)),
+                    None => println!("* {} is no longer a friend", self.who(&peer)),
+                    _ => {}
+                }
+            }
+            Update::Profile { peer } => {
+                if let Some(n) = self.hearth.known_names().await.ok().and_then(|v| v.into_iter().find(|(p, _)| *p == peer)) {
+                    self.names.insert(peer, n.1);
+                }
+            }
+            Update::ServerRemoved { server } => {
+                if self.current.is_some_and(|c| c.0 == server) {
+                    self.current = None;
+                }
+            }
             Update::Voice { server, channel, peers, .. } => {
                 let Some(s) = self.hearth.servers().await.ok().and_then(|v| v.into_iter().find(|s| s.id == server)) else {
                     return;
@@ -545,15 +639,22 @@ impl Repl {
                 if m.author == self.hearth.id() {
                     return;
                 }
-                if self.current == Some((server, m.channel)) {
-                    println!("<{}> {}", self.who(&m.author), m.body);
+                let body = render(&m);
+                if let Some(friend) = summary.as_ref().and_then(|s| s.dm) {
+                    println!("[dm {}] {}", self.who(&friend), body);
+                } else if self.current == Some((server, m.channel)) {
+                    println!("<{}> {}", self.who(&m.author), body);
                 } else {
                     let ch = summary
                         .and_then(|s| s.channels.into_iter().find(|c| c.id == m.channel))
                         .map(|c| c.name)
                         .unwrap_or_else(|| "?".into());
-                    println!("[{sname} #{ch}] <{}> {}", self.who(&m.author), m.body);
+                    println!("[{sname} #{ch}] <{}> {}", self.who(&m.author), body);
                 }
+            }
+            Change::Renamed(_) if summary.as_ref().is_some_and(|s| s.dm.is_some()) => {
+                let friend = summary.and_then(|s| s.dm).expect("checked");
+                println!("* dm with {} ready", self.who(&friend));
             }
             Change::Renamed(name) => {
                 println!("* server {name} synced");
@@ -582,6 +683,16 @@ impl Repl {
                 }
             }
             Change::Epoch(e) => println!("* {sname} rotated to key epoch {e}"),
+            Change::MessageUpdated(m) => {
+                if m.deleted {
+                    println!("* a message from {} was deleted", self.who(&m.author));
+                } else if !m.reactions.is_empty() {
+                    let r: Vec<String> = m.reactions.iter().map(|(e, who)| format!("{e}{}", who.len())).collect();
+                    let whose = if m.author == self.hearth.id() { "your".to_string() } else { format!("{}'s", self.who(&m.author)) };
+                    println!("* reactions on {whose} message: {}", r.join(" "));
+                }
+            }
+            Change::LeaveRequested(p) => println!("* {} left {sname}", self.who(&p)),
             Change::HostAdded(p) => println!("* {sname} is now stored on node {}", p.fmt_short()),
             Change::HostRemoved(p) => println!("* node {} no longer stores {sname}", p.fmt_short()),
         }

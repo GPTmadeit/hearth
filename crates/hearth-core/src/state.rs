@@ -10,7 +10,7 @@ use iroh::{EndpointId as PeerId, SecretKey};
 
 use crate::{
     crypto::EpochKey,
-    event::{AdminOp, Body, ChannelKind, Content, Event, EventId, ServerId},
+    event::{AdminOp, Attachment, Body, ChannelKind, Content, Event, EventId, ServerId},
 };
 
 const MAX_PENDING: usize = 50_000;
@@ -33,6 +33,20 @@ pub struct ChatMessage {
     pub author: PeerId,
     pub body: String,
     pub sent_at_ms: u64,
+    pub reply_to: Option<EventId>,
+    pub attachments: Vec<Attachment>,
+    pub edited: bool,
+    pub deleted: bool,
+    /// emoji -> who reacted with it, in the order they did.
+    pub reactions: BTreeMap<String, Vec<PeerId>>,
+}
+
+/// A change aimed at a message that may not have arrived yet.
+#[derive(Debug, Clone)]
+enum Modify {
+    Edit(String),
+    Delete,
+    React { emoji: String, on: bool },
 }
 
 /// A user-visible consequence of ingesting events or keys.
@@ -43,6 +57,10 @@ pub enum Change {
     Message(ChatMessage),
     MemberAdded(PeerId),
     MemberRemoved(PeerId),
+    /// A member asked to leave. The owner's client acts on it.
+    LeaveRequested(PeerId),
+    /// A message was edited, deleted, or reacted to.
+    MessageUpdated(ChatMessage),
     HostAdded(PeerId),
     HostRemoved(PeerId),
     Epoch(u32),
@@ -89,6 +107,10 @@ pub struct ServerState {
     pub name: Option<String>,
     pub channels: BTreeMap<EventId, Channel>,
     pub messages: BTreeMap<EventId, Vec<ChatMessage>>,
+    /// Which channel each message is in.
+    located: HashMap<EventId, EventId>,
+    /// Modifications waiting for their target message, with who made them.
+    pending_mods: HashMap<EventId, Vec<(PeerId, Modify)>>,
 }
 
 impl ServerState {
@@ -108,6 +130,56 @@ impl ServerState {
             name: None,
             channels: BTreeMap::new(),
             messages: BTreeMap::new(),
+            located: HashMap::new(),
+            pending_mods: HashMap::new(),
+        }
+    }
+
+    pub fn message(&self, id: &EventId) -> Option<&ChatMessage> {
+        let channel = self.located.get(id)?;
+        self.messages.get(channel)?.iter().find(|m| m.id == *id)
+    }
+
+    /// Applies `m` by `by` to its target if it has arrived; otherwise holds it.
+    fn modify(&mut self, target: EventId, by: PeerId, m: Modify, changes: &mut Vec<Change>) {
+        let owner = self.owner;
+        let Some(channel) = self.located.get(&target).copied() else {
+            self.pending_mods.entry(target).or_default().push((by, m));
+            return;
+        };
+        let Some(msg) = self.messages.get_mut(&channel).and_then(|l| l.iter_mut().find(|x| x.id == target)) else {
+            return;
+        };
+        let applied = match m {
+            Modify::Edit(body) if by == msg.author && !msg.deleted => {
+                msg.body = body;
+                msg.edited = true;
+                true
+            }
+            Modify::Delete if by == msg.author || Some(by) == owner => {
+                msg.deleted = true;
+                msg.body.clear();
+                msg.attachments.clear();
+                msg.reactions.clear();
+                true
+            }
+            Modify::React { emoji, on } if !msg.deleted => {
+                let who = msg.reactions.entry(emoji.clone()).or_default();
+                let had = who.contains(&by);
+                if on && !had {
+                    who.push(by);
+                } else if !on && had {
+                    who.retain(|p| *p != by);
+                }
+                if who.is_empty() {
+                    msg.reactions.remove(&emoji);
+                }
+                on != had
+            }
+            _ => false,
+        };
+        if applied {
+            changes.push(Change::MessageUpdated(msg.clone()));
         }
     }
 
@@ -385,6 +457,40 @@ impl ServerState {
         out.accepted.push(e);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn add_message(
+        &mut self,
+        id: EventId,
+        channel: EventId,
+        author: PeerId,
+        body: String,
+        sent_at_ms: u64,
+        reply_to: Option<EventId>,
+        attachments: Vec<Attachment>,
+        changes: &mut Vec<Change>,
+    ) {
+        let msg = ChatMessage {
+            id,
+            channel,
+            author,
+            body,
+            sent_at_ms,
+            reply_to,
+            attachments,
+            edited: false,
+            deleted: false,
+            reactions: BTreeMap::new(),
+        };
+        let list = self.messages.entry(channel).or_default();
+        let at = list.partition_point(|m| (m.sent_at_ms, m.id) <= (sent_at_ms, msg.id));
+        list.insert(at, msg.clone());
+        self.located.insert(id, channel);
+        changes.push(Change::Message(msg));
+        for (by, m) in self.pending_mods.remove(&id).unwrap_or_default() {
+            self.modify(id, by, m, changes);
+        }
+    }
+
     /// Decrypts an accepted sealed event, or parks it until its key arrives.
     fn reveal(&mut self, e: Event, changes: &mut Vec<Change>) {
         let Body::Sealed { epoch, .. } = &e.body else { return };
@@ -407,12 +513,15 @@ impl ServerState {
                 changes.push(Change::Channel(ch));
             }
             Content::Message { channel, body, sent_at_ms } => {
-                let msg = ChatMessage { id: e.id(), channel, author: e.author, body, sent_at_ms };
-                let list = self.messages.entry(channel).or_default();
-                let at = list.partition_point(|m| (m.sent_at_ms, m.id) <= (sent_at_ms, msg.id));
-                list.insert(at, msg.clone());
-                changes.push(Change::Message(msg));
+                self.add_message(e.id(), channel, e.author, body, sent_at_ms, None, Vec::new(), changes);
             }
+            Content::Post { channel, body, sent_at_ms, reply_to, attachments } => {
+                self.add_message(e.id(), channel, e.author, body, sent_at_ms, reply_to, attachments, changes);
+            }
+            Content::Edit { target, body } => self.modify(target, e.author, Modify::Edit(body), changes),
+            Content::Delete { target } => self.modify(target, e.author, Modify::Delete, changes),
+            Content::React { target, emoji, on } => self.modify(target, e.author, Modify::React { emoji, on }, changes),
+            Content::Leave if !from_owner => changes.push(Change::LeaveRequested(e.author)),
             _ => {} // owner-only content from a non-owner: replicated but ignored
         }
     }
@@ -546,6 +655,79 @@ mod tests {
         assert!(host.channels.is_empty() && host.messages.is_empty());
         assert!(host.author_content(&node, &Content::Rename { name: "x".into() }).is_err());
         assert!(s.sync_peers().contains(&node.public()));
+    }
+
+    fn post(s: &ServerState, who: &SecretKey, content: Content) -> Event {
+        s.author_content(who, &content).unwrap()
+    }
+
+    #[test]
+    fn edits_deletes_and_reactions() {
+        let (owner, mut s, _, _) = setup();
+        let bob = SecretKey::generate();
+        let add = s.author_admin(&owner, AdminOp::Add { peer: bob.public() }).unwrap();
+        s.ingest(vec![add]);
+        let ch = text_channel(&s);
+        let m = say(&s, &bob, "frist");
+        let id = m.id();
+        s.ingest(vec![m]);
+
+        // Owner can't edit Bob's message; Bob can.
+        s.ingest(vec![post(&s, &owner, Content::Edit { target: id, body: "hijacked".into() })]);
+        assert_eq!(s.message(&id).unwrap().body, "frist");
+        s.ingest(vec![post(&s, &bob, Content::Edit { target: id, body: "first".into() })]);
+        assert!(s.message(&id).unwrap().edited && s.message(&id).unwrap().body == "first");
+
+        // Reactions toggle per person; the emoji disappears when nobody's left.
+        s.ingest(vec![post(&s, &owner, Content::React { target: id, emoji: "🔥".into(), on: true })]);
+        s.ingest(vec![post(&s, &bob, Content::React { target: id, emoji: "🔥".into(), on: true })]);
+        assert_eq!(s.message(&id).unwrap().reactions["🔥"].len(), 2);
+        s.ingest(vec![post(&s, &bob, Content::React { target: id, emoji: "🔥".into(), on: false })]);
+        s.ingest(vec![post(&s, &owner, Content::React { target: id, emoji: "🔥".into(), on: false })]);
+        assert!(s.message(&id).unwrap().reactions.is_empty());
+
+        // The owner can delete anyone's message.
+        let out = s.ingest(vec![post(&s, &owner, Content::Delete { target: id })]);
+        assert!(matches!(&out.changes[..], [Change::MessageUpdated(m)] if m.deleted && m.body.is_empty()));
+        let _ = ch;
+    }
+
+    #[test]
+    fn reaction_before_message_is_applied_on_arrival() {
+        let (owner, mut s, key, mut log) = setup();
+        let bob = SecretKey::generate();
+        let add = s.author_admin(&owner, AdminOp::Add { peer: bob.public() }).unwrap();
+        log.extend(s.ingest(vec![add]).accepted);
+        let ch = text_channel(&s);
+        let attachment = Attachment {
+            name: "cat.png".into(),
+            mime: "image/png".into(),
+            blob: crate::blob::BlobRef { hash: [1; 32], key: [2; 32], size: 3 },
+        };
+        // Bob posts; the owner reacts. Replicas process the owner's chain first,
+        // so the reaction is seen before the message it targets.
+        let m = post(&s, &bob, Content::Post { channel: ch, body: "look".into(), sent_at_ms: 5, reply_to: None, attachments: vec![attachment.clone()] });
+        let id = m.id();
+        log.extend(s.ingest(vec![m]).accepted);
+        log.extend(s.ingest(vec![post(&s, &owner, Content::React { target: id, emoji: "😺".into(), on: true })]).accepted);
+
+        let mut r = ServerState::new(s.id);
+        r.offer_key(0, key);
+        r.ingest(log);
+        assert!(r.pending_mods.is_empty(), "held reaction was applied");
+        let msg = r.message(&id).unwrap();
+        assert_eq!(msg.reactions["😺"], [owner.public()]);
+        assert_eq!(msg.attachments, [attachment]);
+    }
+
+    #[test]
+    fn leave_is_surfaced_to_owner() {
+        let (owner, mut s, _, _) = setup();
+        let bob = SecretKey::generate();
+        let add = s.author_admin(&owner, AdminOp::Add { peer: bob.public() }).unwrap();
+        s.ingest(vec![add]);
+        let out = s.ingest(vec![post(&s, &bob, Content::Leave)]);
+        assert!(out.changes.contains(&Change::LeaveRequested(bob.public())));
     }
 
     #[test]

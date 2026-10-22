@@ -8,6 +8,7 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    blob::BlobRef,
     crypto::EpochKey,
     event::{Event, EventId, ServerId},
 };
@@ -37,6 +38,20 @@ pub enum Frame {
     Watch { server: ServerId, on: bool },
     /// A direct message, delivered only while both peers are online.
     Dm { body: String, sent_at_ms: u64 },
+    // ---- 0.2: append new variants only, so older peers can skip what they don't know ----
+    /// The sender started or stopped talking in their voice channel of `server`.
+    Speaking { server: ServerId, speaking: bool },
+    /// The sender is typing in a channel.
+    Typing { server: ServerId, channel: EventId },
+    FriendRequest { name: String },
+    /// Accepts a friend request. `dm` is the conversation the sender created for
+    /// the two of you; whichever of you has the smaller ID creates it.
+    FriendAccept { dm: Option<ServerId> },
+    FriendRemove,
+    /// "I have this blob for `server`": storage hosts fetch it for offline delivery.
+    BlobOffer { server: ServerId, hash: [u8; 32], size: u64 },
+    /// The sender's display name and profile picture.
+    Profile { name: String, avatar: Option<BlobRef> },
 }
 
 pub async fn write(send: &mut SendStream, frame: &Frame) -> Result<()> {
@@ -50,25 +65,42 @@ pub async fn write(send: &mut SendStream, frame: &Frame) -> Result<()> {
 }
 
 /// Reads the next frame, or `None` if the peer finished the stream cleanly.
+/// Frames we can't decode (from a newer version) are skipped, not fatal.
 pub async fn read(recv: &mut RecvStream) -> Result<Option<Frame>> {
-    let mut len = [0u8; 4];
-    match recv.read_exact(&mut len).await {
-        Ok(()) => {}
-        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
-        Err(e) => return Err(e.into()),
+    loop {
+        let mut len = [0u8; 4];
+        match recv.read_exact(&mut len).await {
+            Ok(()) => {}
+            Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_be_bytes(len);
+        if len > MAX_FRAME {
+            bail!("peer sent oversized frame ({len} bytes)");
+        }
+        let mut buf = vec![0u8; len as usize];
+        recv.read_exact(&mut buf).await?;
+        if let Ok(frame) = postcard::from_bytes(&buf) {
+            return Ok(Some(frame));
+        }
     }
-    let len = u32::from_be_bytes(len);
-    if len > MAX_FRAME {
-        bail!("peer sent oversized frame ({len} bytes)");
-    }
-    let mut buf = vec![0u8; len as usize];
-    recv.read_exact(&mut buf).await?;
-    Ok(Some(postcard::from_bytes(&buf)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appended_variants_keep_old_encodings() {
+        // Variant tags 0.1 peers use. Reordering would make old and new peers misread each other.
+        let tag = |f: &Frame| postcard::to_stdvec(f).unwrap()[0];
+        assert_eq!(tag(&Frame::Hello { name: String::new() }), 0);
+        assert_eq!(tag(&Frame::Events(vec![])), 2);
+        assert_eq!(tag(&Frame::Removed { server: ServerId([0; 32]) }), 5);
+        assert_eq!(tag(&Frame::Dm { body: "hi".into(), sent_at_ms: 1 }), 8);
+        let old = Frame::Dm { body: "hi".into(), sent_at_ms: 1 };
+        assert_eq!(postcard::from_bytes::<Frame>(&postcard::to_stdvec(&old).unwrap()).unwrap(), old);
+    }
 
     #[test]
     fn roundtrip() {

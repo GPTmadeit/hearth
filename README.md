@@ -8,18 +8,31 @@ that never leaves your device.
 
 - **Identity**: an ed25519 key is your account and your network address. Share
   your peer ID; friends dial you by it.
-- **Servers and channels**: text and voice channels, invites, kicks. History
-  syncs between members, so anyone online can bring you up to date.
+- **Friends and DMs**: friend requests by peer ID (accept, decline, remove,
+  block). Each friendship gets a private, encrypted conversation with history,
+  voice calls, and offline delivery. Requests reach offline friends later.
+- **Servers and channels**: text and voice channels, invites, kicks, leaving.
+  History syncs between members, so anyone online can bring you up to date.
+- **Messages**: replies, edits, deletes, emoji reactions, an emoji picker and
+  `:shortcodes:`, **bold**/*italic*/`code`, clickable links, @mentions,
+  typing indicators, unread counts.
+- **Files, images, video**: drag, paste, or attach up to 100 MB each. Every
+  file is encrypted with its own key and fetched peer to peer. Images and video
+  play inline.
+- **Notifications**: desktop notifications and a sound for DMs, mentions,
+  friend requests, and invites. Per-server levels and do-not-disturb.
+- **Profiles**: display name and profile picture, shared with your contacts.
 - **Encryption**: messages are sealed (XChaCha20-Poly1305) under a server key
   only members hold. Removing someone rotates the key.
 - **Voice**: Opus at 64 kbps with forward error correction over QUIC datagrams,
-  with a jitter buffer and loss concealment. Mute and deafen. If there's no
+  with a jitter buffer and loss concealment. Mute and deafen. Speaking rings
+  show for everyone in the server, not just people in the call. If there's no
   microphone you join listen-only.
 - **Screen share** (desktop app): hardware H.264 up to 1440p60 through WebCodecs,
   sent only to people who click *Watch*, one QUIC stream per frame, and frames
   are skipped for viewers who fall behind.
 - **Offline delivery**: run `hearth node` somewhere always-on. It stores and
-  forwards servers' encrypted history but is never given keys.
+  forwards servers' encrypted history and files but is never given keys.
 - **Your own relay**: `--relay https://your.relay` to avoid public relays.
 
 ## Quick start
@@ -118,8 +131,10 @@ relays, storage nodes and network observers. Be aware of these limits:
   protect your device. OS keychain integration is planned.
 - **Permissions.** Only the owner can invite, remove and create channels. There
   are no roles yet.
-- **DMs** are live-only (both people online). Planned: two-person servers, which
-  would add history and offline delivery.
+- **Files** are available while their sender, someone who downloaded them, or
+  a storage node is online.
+- **DM offline delivery** needs one of you to be online, or a storage node.
+  Friend requests and invites queue until the other person comes online.
 - **Screen share** requires WebCodecs. It works in the Windows app (WebView2),
   but Linux WebKitGTK may not support it yet.
 - **Mesh voice.** Every participant sends audio to every other participant,

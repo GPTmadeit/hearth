@@ -20,16 +20,19 @@ use iroh::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    blob::{self, BlobRef, BlobStore},
     crypto,
-    event::{AdminOp, ChannelKind, Content, Event, EventId, ServerId},
+    event::{AdminOp, Attachment, ChannelKind, Content, Event, EventId, ServerId},
     media::{MediaHub, RoomConfig, VoiceSession},
     proto::{self, ALPN, Frame},
     state::{Change, Channel, ChatMessage, ServerState, key_hash},
-    store::Store,
+    store::{FriendRecord, FriendState, Store},
 };
 
 const BATCH: usize = 128;
 const MAX_BODY: usize = 4000;
+const MAX_ATTACHMENTS: usize = 10;
+const BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONNECT_EVERY: Duration = Duration::from_secs(30);
 
 pub struct Config {
@@ -60,6 +63,32 @@ pub enum Update {
     Voice { server: ServerId, channel: EventId, peers: Vec<PeerId>, live: Vec<PeerId> },
     /// Someone started watching our stream: the next video frame should be a keyframe.
     KeyframeRequested,
+    /// A member in voice started or stopped talking (including us).
+    Speaking { server: ServerId, peer: PeerId, speaking: bool },
+    Typing { server: ServerId, channel: EventId, peer: PeerId },
+    /// A friendship changed; `request` is set when someone just asked to be friends.
+    Friend { peer: PeerId, request: bool },
+    /// A peer's name or avatar changed.
+    Profile { peer: PeerId },
+    /// We left (or were removed from) a server and dropped our copy.
+    ServerRemoved { server: ServerId },
+}
+
+#[derive(Debug, Clone)]
+pub struct FriendView {
+    pub peer: PeerId,
+    pub state: FriendState,
+    pub since_ms: u64,
+    pub dm: Option<ServerId>,
+    pub online: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct VoiceRoom {
+    pub server: ServerId,
+    pub channel: EventId,
+    pub peers: Vec<PeerId>,
+    pub live: Vec<PeerId>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +100,8 @@ pub struct ServerSummary {
     pub hosts: Vec<PeerId>,
     pub channels: Vec<Channel>,
     pub epoch: u32,
+    /// Set for a direct-message conversation with this friend.
+    pub dm: Option<PeerId>,
 }
 
 type Call = Box<dyn FnOnce(&mut Engine) + Send>;
@@ -89,11 +120,13 @@ pub struct Hearth {
     inbox: mpsc::UnboundedSender<Inbox>,
     id: PeerId,
     endpoint: Endpoint,
+    blobs: Arc<BlobStore>,
 }
 
 impl Hearth {
     pub async fn start(cfg: Config) -> Result<(Self, mpsc::UnboundedReceiver<Update>)> {
         let store = Store::open(&cfg.data_dir.join("hearth.redb"))?;
+        let blobs = Arc::new(BlobStore::open(&cfg.data_dir.join("blobs"))?);
         let mut builder = Endpoint::builder(presets::N0).secret_key(cfg.secret.clone());
         if let Some(url) = cfg.relay {
             builder = builder.relay_mode(RelayMode::Custom(url.into()));
@@ -103,7 +136,7 @@ impl Hearth {
         let (updates, updates_rx) = mpsc::unbounded_channel();
 
         let media = Arc::new(MediaHub::default());
-        let handler = Accept { name: cfg.name.clone(), inbox: inbox.clone(), media: media.clone() };
+        let handler = Accept(Shared { name: cfg.name.clone(), inbox: inbox.clone(), media: media.clone(), blobs: blobs.clone() });
         let router = Router::builder(endpoint.clone()).accept(ALPN, handler).spawn();
 
         let mut engine = Engine {
@@ -119,6 +152,12 @@ impl Hearth {
             voice: HashMap::new(),
             my_voice: None,
             watchers: HashSet::new(),
+            speaking: false,
+            blobs: blobs.clone(),
+            friends: HashMap::new(),
+            dms: HashMap::new(),
+            avatars: HashMap::new(),
+            my_avatar: None,
             updates,
             inbox: inbox.clone(),
             endpoint: endpoint.clone(),
@@ -139,7 +178,7 @@ impl Hearth {
         });
 
         let id = endpoint.id();
-        Ok((Self { inbox, id, endpoint }, updates_rx))
+        Ok((Self { inbox, id, endpoint, blobs }, updates_rx))
     }
 
     pub fn id(&self) -> PeerId {
@@ -255,6 +294,118 @@ impl Hearth {
         self.call(|e| e.peers.iter().map(|(p, c)| (*p, c.name.clone())).collect()).await
     }
 
+    /// Every voice channel with someone in it, across all servers.
+    pub async fn voice_snapshot(&self) -> Result<Vec<VoiceRoom>> {
+        self.call(|e| e.voice_rooms()).await
+    }
+
+    /// Tells the server whether we're talking, for speaking indicators everywhere.
+    pub async fn set_speaking(&self, speaking: bool) -> Result<()> {
+        self.call(move |e| e.set_speaking(speaking)).await
+    }
+
+    pub async fn typing(&self, server: ServerId, channel: EventId) -> Result<()> {
+        self.call(move |e| e.typing(server, channel)).await
+    }
+
+    /// Posts a message, optionally replying and with attachments made by [`Hearth::upload`].
+    pub async fn post(
+        &self,
+        server: ServerId,
+        channel: EventId,
+        body: String,
+        reply_to: Option<EventId>,
+        attachments: Vec<Attachment>,
+    ) -> Result<EventId> {
+        self.call(move |e| e.post(server, channel, body, reply_to, attachments)).await?
+    }
+
+    pub async fn edit(&self, server: ServerId, target: EventId, body: String) -> Result<()> {
+        self.call(move |e| e.edit(server, target, body)).await?
+    }
+
+    pub async fn delete(&self, server: ServerId, target: EventId) -> Result<()> {
+        self.call(move |e| e.delete(server, target)).await?
+    }
+
+    pub async fn react(&self, server: ServerId, target: EventId, emoji: String, on: bool) -> Result<()> {
+        self.call(move |e| e.react(server, target, emoji, on)).await?
+    }
+
+    pub async fn leave_server(&self, server: ServerId) -> Result<()> {
+        self.call(move |e| e.leave_server(server)).await?
+    }
+
+    pub async fn friends(&self) -> Result<Vec<FriendView>> {
+        self.call(|e| e.friend_views()).await
+    }
+
+    /// Sends a friend request, or accepts one they sent us.
+    pub async fn add_friend(&self, peer: PeerId) -> Result<()> {
+        self.call(move |e| e.add_friend(peer)).await?
+    }
+
+    /// Unfriends, cancels a request we sent, or declines one we received.
+    pub async fn remove_friend(&self, peer: PeerId) -> Result<()> {
+        self.call(move |e| e.remove_friend(peer)).await?
+    }
+
+    pub async fn block(&self, peer: PeerId, blocked: bool) -> Result<()> {
+        self.call(move |e| e.block(peer, blocked)).await?
+    }
+
+    pub async fn set_name(&self, name: String) -> Result<()> {
+        self.call(move |e| e.set_profile(Some(name), None)).await
+    }
+
+    /// Sets (or clears) our profile picture from image bytes.
+    pub async fn set_avatar(&self, image: Option<Vec<u8>>) -> Result<()> {
+        let avatar = match image {
+            Some(bytes) => Some(self.upload(&bytes)?),
+            None => None,
+        };
+        self.call(move |e| e.set_profile(None, Some(avatar))).await
+    }
+
+    /// Everyone's profile picture we know of, including ours.
+    pub async fn avatars(&self) -> Result<Vec<(PeerId, BlobRef)>> {
+        self.call(|e| {
+            let mut v: Vec<(PeerId, BlobRef)> = e.avatars.iter().map(|(p, a)| (*p, *a)).collect();
+            v.extend(e.my_avatar.map(|a| (e.me(), a)));
+            v
+        })
+        .await
+    }
+
+    /// Encrypts and stores a file locally, ready to attach.
+    pub fn upload(&self, bytes: &[u8]) -> Result<BlobRef> {
+        if bytes.len() as u64 > blob::MAX_BLOB {
+            bail!("files can be up to {} MB", blob::MAX_BLOB / 1024 / 1024);
+        }
+        let (r, ct) = blob::seal(bytes);
+        self.blobs.put(&r.hash, &ct)?;
+        Ok(r)
+    }
+
+    /// Returns a blob's contents, downloading it if needed: from `prefer`
+    /// first, then storage nodes, then anyone else we're connected to.
+    pub async fn fetch(&self, r: BlobRef, prefer: Vec<PeerId>) -> Result<Vec<u8>> {
+        if let Some(ct) = self.blobs.get(&r.hash)? {
+            return blob::open(&r, &ct);
+        }
+        if r.size > blob::MAX_BLOB + blob::MAX_BLOB / 1000 {
+            bail!("file is too large");
+        }
+        let candidates = self.call(move |e| e.blob_sources(&prefer)).await?;
+        for (_, conn) in candidates {
+            if let Ok(Ok(Some(ct))) = tokio::time::timeout(BLOB_TIMEOUT, blob::request(&conn, &r.hash)).await {
+                self.blobs.put(&r.hash, &ct)?;
+                return blob::open(&r, &ct);
+            }
+        }
+        bail!("nobody who has this file is online right now")
+    }
+
     pub async fn shutdown(&self) {
         let _ = self
             .call(|e| {
@@ -296,6 +447,14 @@ struct Engine {
     my_voice: Option<(ServerId, EventId)>,
     /// Peers watching our screen stream.
     watchers: HashSet<PeerId>,
+    /// Whether we're talking right now (for others' indicators).
+    speaking: bool,
+    blobs: Arc<BlobStore>,
+    friends: HashMap<PeerId, FriendRecord>,
+    /// DM conversation -> the friend it's with.
+    dms: HashMap<ServerId, PeerId>,
+    avatars: HashMap<PeerId, BlobRef>,
+    my_avatar: Option<BlobRef>,
     updates: mpsc::UnboundedSender<Update>,
     inbox: mpsc::UnboundedSender<Inbox>,
     endpoint: Endpoint,
@@ -324,6 +483,25 @@ impl Engine {
             }
             state.ingest(self.store.events(id)?);
             self.servers.insert(id, state);
+        }
+        self.friends = self.store.friends()?.into_iter().collect();
+        self.dms = self.store.dms()?.into_iter().collect();
+        self.avatars = self.store.avatars()?.into_iter().collect();
+        self.my_avatar = self.store.meta("avatar")?;
+        Ok(())
+    }
+
+    fn is_blocked(&self, peer: &PeerId) -> bool {
+        self.friends.get(peer).is_some_and(|f| f.state == FriendState::Blocked)
+    }
+
+    /// Sends now if connected; otherwise keeps it until we are.
+    fn send_or_queue(&mut self, peer: PeerId, frame: Frame) -> Result<()> {
+        if self.peers.contains_key(&peer) {
+            self.send_to(&peer, frame);
+        } else {
+            self.store.push_outbox(peer, &frame)?;
+            self.dial(peer);
         }
         Ok(())
     }
@@ -369,8 +547,8 @@ impl Engine {
         if peer == self.me() || self.peers.contains_key(&peer) || !self.dialing.insert(peer) {
             return;
         }
-        let (endpoint, inbox, name) = (self.endpoint.clone(), self.inbox.clone(), self.name.clone());
-        let media = self.media.clone();
+        let endpoint = self.endpoint.clone();
+        let shared = Shared { name: self.name.clone(), inbox: self.inbox.clone(), media: self.media.clone(), blobs: self.blobs.clone() };
         tokio::spawn(async move {
             let result = async {
                 let conn = endpoint.connect(peer, ALPN).await?;
@@ -378,25 +556,30 @@ impl Engine {
                 anyhow::Ok((conn, send, recv))
             }
             .await;
-            let inbox2 = inbox.clone();
-            let _ = inbox.send(Inbox::Call(Box::new(move |e| {
+            let _ = shared.inbox.send(Inbox::Call(Box::new(move |e| {
                 e.dialing.remove(&peer);
             })));
             if let Ok((conn, send, recv)) = result {
-                let _ = drive(conn, send, recv, name, true, inbox2, media).await;
+                let _ = drive(conn, send, recv, true, shared).await;
             }
         });
     }
 
     /// Keeps a connection to every member of every server we're in.
     fn reconnect(&mut self) {
-        let wanted: HashSet<PeerId> = self.servers.values().flat_map(|s| s.sync_peers()).collect();
+        let mut wanted: HashSet<PeerId> = self.servers.values().flat_map(|s| s.sync_peers()).collect();
+        wanted.extend(self.friends.iter().filter(|(_, f)| f.state != FriendState::Blocked).map(|(p, _)| *p));
+        wanted.retain(|p| !self.is_blocked(p));
         for peer in wanted {
             self.dial(peer);
         }
     }
 
     fn on_connected(&mut self, peer: PeerId, new: PeerConn) {
+        if self.is_blocked(&peer) {
+            new.conn.close(0u32.into(), b"blocked");
+            return;
+        }
         // If both sides dialed at once, both keep the one dialed by the smaller id.
         let preferred_dialed = self.me() < peer;
         if let Some(old) = self.peers.get(&peer) {
@@ -428,6 +611,18 @@ impl Engine {
             let me = self.me();
             let live = self.voice.get(&server).and_then(|r| r.get(&me)).is_some_and(|s| s.live);
             self.send_to(&peer, Frame::Voice { server, channel: Some(channel), live });
+            if self.speaking {
+                self.send_to(&peer, Frame::Speaking { server, speaking: true });
+            }
+        }
+        self.send_to(&peer, Frame::Profile { name: self.name.clone(), avatar: self.my_avatar });
+        match self.store.take_outbox(peer) {
+            Ok(frames) => {
+                for f in frames {
+                    self.send_to(&peer, f);
+                }
+            }
+            Err(e) => eprintln!("reading outbox: {e:#}"),
         }
         self.refresh_media();
     }
@@ -442,12 +637,51 @@ impl Engine {
     // ---- inbound ----
 
     fn on_frame(&mut self, peer: PeerId, frame: Frame) -> Result<()> {
+        if self.is_blocked(&peer) {
+            return Ok(());
+        }
         match frame {
             Frame::Hello { .. } => {}
+            Frame::Speaking { server, speaking } => {
+                if self.voice.get(&server).is_some_and(|r| r.contains_key(&peer)) {
+                    self.emit(Update::Speaking { server, peer, speaking });
+                }
+            }
+            Frame::Typing { server, channel } => {
+                if self.servers.get(&server).is_some_and(|s| s.is_member(&peer)) {
+                    self.emit(Update::Typing { server, channel, peer });
+                }
+            }
+            Frame::FriendRequest { name } => self.on_friend_request(peer, name)?,
+            Frame::FriendAccept { dm } => self.on_friend_accept(peer, dm)?,
+            Frame::FriendRemove => {
+                if self.friends.get(&peer).is_some_and(|f| f.state != FriendState::Blocked) {
+                    self.friends.remove(&peer);
+                    self.store.put_friend(peer, None)?;
+                    self.emit(Update::Friend { peer, request: false });
+                }
+            }
+            Frame::BlobOffer { server, hash, size } => self.on_blob_offer(peer, server, hash, size),
+            Frame::Profile { name, avatar } => {
+                let name: String = name.chars().take(64).collect();
+                self.store.put_name(peer, &name)?;
+                self.store.put_avatar(peer, avatar)?;
+                match avatar {
+                    Some(a) => self.avatars.insert(peer, a),
+                    None => self.avatars.remove(&peer),
+                };
+                if let Some(p) = self.peers.get_mut(&peer) {
+                    p.name = name;
+                }
+                self.emit(Update::Profile { peer });
+            }
             Frame::Dm { body, sent_at_ms } => self.emit(Update::Dm { peer, body, sent_at_ms }),
             Frame::Invite { server, name } => {
                 if self.servers.contains_key(&server) {
                     return Ok(());
+                }
+                if self.dms.get(&server) == Some(&peer) {
+                    return self.join(server, peer);
                 }
                 match &self.host {
                     Some(policy) if policy.allow.is_empty() || policy.allow.contains(&peer) => {
@@ -571,6 +805,12 @@ impl Engine {
             }
             if let Change::Epoch(_) = &change {
                 self.refresh_media();
+            }
+            if let Change::LeaveRequested(peer) = &change
+                && self.servers[&server].owner() == Some(self.me())
+                && self.servers[&server].is_member(peer)
+            {
+                self.kick(server, *peer)?;
             }
             self.emit(Update::Server { server, change });
         }
@@ -732,6 +972,7 @@ impl Engine {
         let Some((server, _)) = self.my_voice.take() else { return };
         self.media.set_sink(None);
         self.watchers.clear();
+        self.speaking = false;
         let me = self.me();
         self.set_voice(Some(server), me, None);
     }
@@ -850,6 +1091,331 @@ impl Engine {
         Ok(())
     }
 
+    // ---- presence ----
+
+    fn voice_rooms(&self) -> Vec<VoiceRoom> {
+        let mut out = Vec::new();
+        for (server, rooms) in &self.voice {
+            let mut by_channel: HashMap<EventId, VoiceRoom> = HashMap::new();
+            for (peer, slot) in rooms {
+                let room = by_channel.entry(slot.channel).or_insert_with(|| VoiceRoom {
+                    server: *server,
+                    channel: slot.channel,
+                    peers: Vec::new(),
+                    live: Vec::new(),
+                });
+                room.peers.push(*peer);
+                if slot.live {
+                    room.live.push(*peer);
+                }
+            }
+            out.extend(by_channel.into_values());
+        }
+        out
+    }
+
+    fn set_speaking(&mut self, speaking: bool) {
+        if self.speaking == speaking {
+            return;
+        }
+        self.speaking = speaking;
+        let Some((server, _)) = self.my_voice else { return };
+        let me = self.me();
+        self.emit(Update::Speaking { server, peer: me, speaking });
+        for m in self.servers[&server].members() {
+            self.send_to(&m, Frame::Speaking { server, speaking });
+        }
+    }
+
+    fn typing(&self, server: ServerId, channel: EventId) {
+        let Some(s) = self.servers.get(&server) else { return };
+        for m in s.members() {
+            self.send_to(&m, Frame::Typing { server, channel });
+        }
+    }
+
+    fn set_profile(&mut self, name: Option<String>, avatar: Option<Option<BlobRef>>) {
+        if let Some(n) = name {
+            self.name = n;
+        }
+        if let Some(a) = avatar {
+            self.my_avatar = a;
+            if let Err(e) = self.store.put_meta("avatar", &a) {
+                eprintln!("saving avatar: {e:#}");
+            }
+        }
+        let frame = Frame::Profile { name: self.name.clone(), avatar: self.my_avatar };
+        for p in self.peers.keys() {
+            self.send_to(p, frame.clone());
+        }
+        let me = self.me();
+        self.emit(Update::Profile { peer: me });
+    }
+
+    // ---- messages ----
+
+    fn post(
+        &mut self,
+        server: ServerId,
+        channel: EventId,
+        body: String,
+        reply_to: Option<EventId>,
+        attachments: Vec<Attachment>,
+    ) -> Result<EventId> {
+        if body.chars().count() > MAX_BODY {
+            bail!("message longer than {MAX_BODY} characters");
+        }
+        if body.trim().is_empty() && attachments.is_empty() {
+            bail!("message is empty");
+        }
+        if attachments.len() > MAX_ATTACHMENTS {
+            bail!("up to {MAX_ATTACHMENTS} attachments per message");
+        }
+        match self.server(server)?.channels.get(&channel) {
+            Some(c) if c.kind == ChannelKind::Text => {}
+            _ => bail!("unknown text channel"),
+        }
+        let offers: Vec<(blob::BlobHash, u64)> = attachments.iter().map(|a| (a.blob.hash, a.blob.size)).collect();
+        let sent_at_ms = now_ms();
+        let id = self.author_content(server, Content::Post { channel, body, sent_at_ms, reply_to, attachments })?;
+        // Storage nodes fetch the files so they're available while we're offline.
+        for host in self.servers[&server].hosts().to_vec() {
+            for (hash, size) in &offers {
+                self.send_to(&host, Frame::BlobOffer { server, hash: *hash, size: *size });
+            }
+        }
+        Ok(id)
+    }
+
+    fn own_message(&self, server: ServerId, target: EventId) -> Result<&ChatMessage> {
+        let m = self.server(server)?.message(&target).context("message not found")?;
+        if m.author != self.me() {
+            bail!("you can only change your own messages");
+        }
+        Ok(m)
+    }
+
+    fn edit(&mut self, server: ServerId, target: EventId, body: String) -> Result<()> {
+        if body.trim().is_empty() || body.chars().count() > MAX_BODY {
+            bail!("messages must be 1 to {MAX_BODY} characters");
+        }
+        self.own_message(server, target)?;
+        self.author_content(server, Content::Edit { target, body })?;
+        Ok(())
+    }
+
+    fn delete(&mut self, server: ServerId, target: EventId) -> Result<()> {
+        let s = self.server(server)?;
+        if s.owner() != Some(self.me()) {
+            self.own_message(server, target)?;
+        }
+        self.author_content(server, Content::Delete { target })?;
+        Ok(())
+    }
+
+    fn react(&mut self, server: ServerId, target: EventId, emoji: String, on: bool) -> Result<()> {
+        if emoji.is_empty() || emoji.chars().count() > 16 {
+            bail!("not an emoji");
+        }
+        self.server(server)?.message(&target).context("message not found")?;
+        self.author_content(server, Content::React { target, emoji, on })?;
+        Ok(())
+    }
+
+    fn leave_server(&mut self, server: ServerId) -> Result<()> {
+        let s = self.server(server)?;
+        let owner = s.owner();
+        if owner == Some(self.me()) {
+            bail!("you own this server, so you can't leave it");
+        }
+        if s.is_member(&self.me()) && s.keys().contains_key(&s.epoch()) {
+            let e = s.author_content(&self.secret, &Content::Leave)?;
+            self.ingest(server, vec![e.clone()], None)?;
+            // Make sure the owner hears about it even if they're offline right now.
+            if let Some(o) = owner
+                && !self.peers.contains_key(&o)
+            {
+                self.store.push_outbox(o, &Frame::Events(vec![e]))?;
+            }
+        }
+        self.forget_server(server)
+    }
+
+    fn forget_server(&mut self, server: ServerId) -> Result<()> {
+        if self.my_voice.is_some_and(|(s, _)| s == server) {
+            self.voice_leave();
+        }
+        self.servers.remove(&server);
+        self.dms.remove(&server);
+        self.voice.remove(&server);
+        self.store.remove_server(server)?;
+        self.emit(Update::ServerRemoved { server });
+        Ok(())
+    }
+
+    // ---- files ----
+
+    /// Connections to try for a blob, best first.
+    fn blob_sources(&self, prefer: &[PeerId]) -> Vec<(PeerId, Connection)> {
+        let hosts: HashSet<PeerId> = self.servers.values().flat_map(|s| s.hosts().to_vec()).collect();
+        let mut order: Vec<PeerId> = prefer.to_vec();
+        order.extend(hosts.iter().copied());
+        order.extend(self.peers.keys().copied());
+        let mut seen = HashSet::new();
+        order
+            .into_iter()
+            .filter(|p| seen.insert(*p))
+            .filter_map(|p| self.peers.get(&p).map(|c| (p, c.conn.clone())))
+            .collect()
+    }
+
+    /// Storage hosts pull files that members offer, so they can serve them later.
+    fn on_blob_offer(&self, peer: PeerId, server: ServerId, hash: blob::BlobHash, size: u64) {
+        let me = self.me();
+        let hosted = self.servers.get(&server).is_some_and(|s| s.is_host(&me) && s.is_member(&peer));
+        if self.host.is_none() || !hosted || size > blob::MAX_BLOB * 2 || self.blobs.has(&hash) {
+            return;
+        }
+        let Some(conn) = self.peers.get(&peer).map(|c| c.conn.clone()) else { return };
+        let blobs = self.blobs.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(Some(ct))) = tokio::time::timeout(BLOB_TIMEOUT, blob::request(&conn, &hash)).await {
+                let _ = blobs.put(&hash, &ct);
+            }
+        });
+    }
+
+    // ---- friends ----
+
+    fn friend_views(&self) -> Vec<FriendView> {
+        self.friends
+            .iter()
+            .map(|(peer, f)| FriendView {
+                peer: *peer,
+                state: f.state,
+                since_ms: f.since_ms,
+                dm: self.dms.iter().find(|(_, p)| *p == peer).map(|(s, _)| *s),
+                online: self.peers.contains_key(peer),
+            })
+            .collect()
+    }
+
+    fn set_friend(&mut self, peer: PeerId, state: Option<FriendState>, request: bool) -> Result<()> {
+        let record = state.map(|state| FriendRecord { state, since_ms: now_ms() });
+        match record {
+            Some(r) => self.friends.insert(peer, r),
+            None => self.friends.remove(&peer),
+        };
+        self.store.put_friend(peer, record)?;
+        self.emit(Update::Friend { peer, request });
+        Ok(())
+    }
+
+    fn dm_with(&self, peer: &PeerId) -> Option<ServerId> {
+        self.dms.iter().find(|(_, p)| *p == peer).map(|(s, _)| *s)
+    }
+
+    /// Both sides agreed. Exactly one DM gets created: by whoever has the smaller ID.
+    fn become_friends(&mut self, peer: PeerId) -> Result<()> {
+        // Create the DM before announcing, so the UI sees both at once.
+        let mut dm = self.dm_with(&peer);
+        if dm.is_none() && self.me() < peer {
+            dm = Some(self.create_dm(peer)?);
+        }
+        self.set_friend(peer, Some(FriendState::Friends), false)?;
+        self.send_or_queue(peer, Frame::FriendAccept { dm })
+    }
+
+    fn create_dm(&mut self, peer: PeerId) -> Result<ServerId> {
+        let id = self.create_server("")?;
+        self.author_admin(id, AdminOp::Add { peer })?;
+        self.dms.insert(id, peer);
+        self.store.put_dm(id, peer)?;
+        Ok(id)
+    }
+
+    fn add_friend(&mut self, peer: PeerId) -> Result<()> {
+        if peer == self.me() {
+            bail!("that's your own ID");
+        }
+        match self.friends.get(&peer).map(|f| f.state) {
+            Some(FriendState::Blocked) => bail!("unblock them first"),
+            Some(FriendState::Friends) => Ok(()),
+            Some(FriendState::Incoming) => self.become_friends(peer),
+            Some(FriendState::Outgoing) | None => {
+                self.set_friend(peer, Some(FriendState::Outgoing), false)?;
+                let name = self.name.clone();
+                self.send_or_queue(peer, Frame::FriendRequest { name })
+            }
+        }
+    }
+
+    fn remove_friend(&mut self, peer: PeerId) -> Result<()> {
+        match self.friends.get(&peer).map(|f| f.state) {
+            Some(FriendState::Blocked) | None => Ok(()),
+            Some(_) => {
+                self.set_friend(peer, None, false)?;
+                self.send_or_queue(peer, Frame::FriendRemove)
+            }
+        }
+    }
+
+    fn block(&mut self, peer: PeerId, blocked: bool) -> Result<()> {
+        if !blocked {
+            if self.is_blocked(&peer) {
+                self.set_friend(peer, None, false)?;
+            }
+            return Ok(());
+        }
+        self.set_friend(peer, Some(FriendState::Blocked), false)?;
+        if let Some(p) = self.peers.remove(&peer) {
+            p.conn.close(0u32.into(), b"blocked");
+            self.emit(Update::PeerOffline { peer });
+            self.set_voice(None, peer, None);
+        }
+        Ok(())
+    }
+
+    fn on_friend_request(&mut self, peer: PeerId, name: String) -> Result<()> {
+        self.store.put_name(peer, &name.chars().take(64).collect::<String>())?;
+        match self.friends.get(&peer).map(|f| f.state) {
+            // We asked them too: that's a yes.
+            Some(FriendState::Outgoing) => self.become_friends(peer),
+            // They lost track of us; answer again.
+            Some(FriendState::Friends) => {
+                let dm = self.dm_with(&peer);
+                self.send_or_queue(peer, Frame::FriendAccept { dm })
+            }
+            Some(FriendState::Incoming) | Some(FriendState::Blocked) => Ok(()),
+            None => self.set_friend(peer, Some(FriendState::Incoming), true),
+        }
+    }
+
+    fn on_friend_accept(&mut self, peer: PeerId, dm: Option<ServerId>) -> Result<()> {
+        if !matches!(self.friends.get(&peer).map(|f| f.state), Some(FriendState::Outgoing | FriendState::Friends)) {
+            return Ok(());
+        }
+        let was_friends = self.friends.get(&peer).is_some_and(|f| f.state == FriendState::Friends);
+        if !was_friends {
+            self.set_friend(peer, Some(FriendState::Friends), false)?;
+        }
+        match (dm, self.dm_with(&peer)) {
+            (Some(theirs), None) => {
+                self.dms.insert(theirs, peer);
+                self.store.put_dm(theirs, peer)?;
+                self.join(theirs, peer)?;
+                self.emit(Update::Friend { peer, request: false });
+            }
+            (None, None) if self.me() < peer => {
+                let ours = self.create_dm(peer)?;
+                self.send_or_queue(peer, Frame::FriendAccept { dm: Some(ours) })?;
+                self.emit(Update::Friend { peer, request: false });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn summaries(&self) -> Vec<ServerSummary> {
         let mut out: Vec<ServerSummary> = self
             .servers
@@ -862,6 +1428,7 @@ impl Engine {
                 hosts: s.hosts().to_vec(),
                 channels: s.channels.values().cloned().collect(),
                 epoch: s.epoch(),
+                dm: self.dms.get(&s.id).copied(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
@@ -869,17 +1436,22 @@ impl Engine {
     }
 }
 
+/// What every connection task needs, whichever side dialed.
 #[derive(Debug, Clone)]
-struct Accept {
+struct Shared {
     name: String,
     inbox: mpsc::UnboundedSender<Inbox>,
     media: Arc<MediaHub>,
+    blobs: Arc<BlobStore>,
 }
+
+#[derive(Debug, Clone)]
+struct Accept(Shared);
 
 impl ProtocolHandler for Accept {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let (send, recv) = conn.accept_bi().await?;
-        let _ = drive(conn, send, recv, self.name.clone(), false, self.inbox.clone(), self.media.clone()).await;
+        let _ = drive(conn, send, recv, false, self.0.clone()).await;
         Ok(())
     }
 }
@@ -887,15 +1459,8 @@ impl ProtocolHandler for Accept {
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
 /// Runs one connection: hello exchange, then a writer task and a read loop.
-async fn drive(
-    conn: Connection,
-    mut send: SendStream,
-    mut recv: RecvStream,
-    our_name: String,
-    dialed: bool,
-    inbox: mpsc::UnboundedSender<Inbox>,
-    media: Arc<MediaHub>,
-) -> Result<()> {
+async fn drive(conn: Connection, mut send: SendStream, mut recv: RecvStream, dialed: bool, shared: Shared) -> Result<()> {
+    let Shared { name: our_name, inbox, media, blobs } = shared;
     let peer = conn.remote_id();
     proto::write(&mut send, &Frame::Hello { name: our_name }).await?;
     let name = match proto::read(&mut recv).await? {
@@ -919,6 +1484,17 @@ async fn drive(
                 if let Ok(data) = recv.read_to_end(crate::media::MAX_VIDEO_FRAME + 1024).await {
                     media.receive(peer, &data);
                 }
+            });
+        }
+    });
+
+    // Further bidirectional streams are blob requests.
+    let requests = conn.clone();
+    tokio::spawn(async move {
+        while let Ok((send, recv)) = requests.accept_bi().await {
+            let blobs = blobs.clone();
+            tokio::spawn(async move {
+                let _ = blob::serve(&blobs, send, recv).await;
             });
         }
     });

@@ -7,9 +7,13 @@ use anyhow::Result;
 use iroh::EndpointId as PeerId;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
+    blob::BlobRef,
     crypto::EpochKey,
     event::{Event, ServerId},
+    proto::Frame,
 };
 
 type EventKey = ([u8; 32], [u8; 32], u64);
@@ -18,6 +22,27 @@ const EVENTS: TableDefinition<EventKey, &[u8]> = TableDefinition::new("events");
 const KEYS: TableDefinition<([u8; 32], u32), [u8; 32]> = TableDefinition::new("keys");
 const SERVERS: TableDefinition<[u8; 32], ()> = TableDefinition::new("servers");
 const NAMES: TableDefinition<[u8; 32], &str> = TableDefinition::new("names");
+const FRIENDS: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("friends");
+const OUTBOX: TableDefinition<([u8; 32], u64), &[u8]> = TableDefinition::new("outbox");
+const DMS: TableDefinition<[u8; 32], [u8; 32]> = TableDefinition::new("dms");
+const AVATARS: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("avatars");
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FriendState {
+    /// They asked us; we haven't answered.
+    Incoming,
+    /// We asked them; they haven't answered.
+    Outgoing,
+    Friends,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FriendRecord {
+    pub state: FriendState,
+    pub since_ms: u64,
+}
 
 pub struct Store {
     db: Database,
@@ -45,6 +70,11 @@ impl Store {
         tx.open_table(KEYS)?;
         tx.open_table(SERVERS)?;
         tx.open_table(NAMES)?;
+        tx.open_table(FRIENDS)?;
+        tx.open_table(OUTBOX)?;
+        tx.open_table(DMS)?;
+        tx.open_table(AVATARS)?;
+        tx.open_table(META)?;
         tx.commit()?;
         Ok(Self { db })
     }
@@ -85,6 +115,142 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Forgets a server entirely: membership, events, and keys.
+    pub fn remove_server(&self, id: ServerId) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            tx.open_table(SERVERS)?.remove(id.0)?;
+            tx.open_table(DMS)?.remove(id.0)?;
+            let mut events = tx.open_table(EVENTS)?;
+            events.retain_in((id.0, [0; 32], 0)..=(id.0, [0xff; 32], u64::MAX), |_, _| false)?;
+            let mut keys = tx.open_table(KEYS)?;
+            keys.retain_in((id.0, 0)..=(id.0, u32::MAX), |_, _| false)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn put_friend(&self, peer: PeerId, record: Option<FriendRecord>) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(FRIENDS)?;
+            match record {
+                Some(r) => {
+                    t.insert(*peer.as_bytes(), postcard::to_stdvec(&r)?.as_slice())?;
+                }
+                None => {
+                    t.remove(*peer.as_bytes())?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn friends(&self) -> Result<Vec<(PeerId, FriendRecord)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(FRIENDS)?.iter()? {
+            let (k, v) = row?;
+            if let (Ok(peer), Ok(r)) = (PeerId::from_bytes(&k.value()), postcard::from_bytes(v.value())) {
+                out.push((peer, r));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queues a frame for `peer` until we next connect to them.
+    pub fn push_outbox(&self, peer: PeerId, frame: &Frame) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(OUTBOX)?;
+            let p = *peer.as_bytes();
+            let next = t.range((p, 0)..=(p, u64::MAX))?.next_back().transpose()?.map(|(k, _)| k.value().1 + 1).unwrap_or(0);
+            t.insert((p, next), postcard::to_stdvec(frame)?.as_slice())?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Removes and returns everything queued for `peer`, oldest first.
+    pub fn take_outbox(&self, peer: PeerId) -> Result<Vec<Frame>> {
+        let tx = self.db.begin_write()?;
+        let mut out = Vec::new();
+        {
+            let mut t = tx.open_table(OUTBOX)?;
+            let p = *peer.as_bytes();
+            for row in t.extract_from_if((p, 0)..=(p, u64::MAX), |_, _| true)? {
+                let (_, v) = row?;
+                if let Ok(f) = postcard::from_bytes(v.value()) {
+                    out.push(f);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    pub fn put_dm(&self, server: ServerId, peer: PeerId) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(DMS)?.insert(server.0, *peer.as_bytes())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn dms(&self) -> Result<Vec<(ServerId, PeerId)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(DMS)?.iter()? {
+            let (k, v) = row?;
+            if let Ok(peer) = PeerId::from_bytes(&v.value()) {
+                out.push((ServerId(k.value()), peer));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_avatar(&self, peer: PeerId, avatar: Option<BlobRef>) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut t = tx.open_table(AVATARS)?;
+            match avatar {
+                Some(a) => {
+                    t.insert(*peer.as_bytes(), postcard::to_stdvec(&a)?.as_slice())?;
+                }
+                None => {
+                    t.remove(*peer.as_bytes())?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn avatars(&self) -> Result<Vec<(PeerId, BlobRef)>> {
+        let tx = self.db.begin_read()?;
+        let mut out = Vec::new();
+        for row in tx.open_table(AVATARS)?.iter()? {
+            let (k, v) = row?;
+            if let (Ok(peer), Ok(a)) = (PeerId::from_bytes(&k.value()), postcard::from_bytes(v.value())) {
+                out.push((peer, a));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn put_meta<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        tx.open_table(META)?.insert(key, postcard::to_stdvec(value)?.as_slice())?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn meta<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
+        let tx = self.db.begin_read()?;
+        let t = tx.open_table(META)?;
+        Ok(t.get(key)?.and_then(|v| postcard::from_bytes(v.value()).ok()))
     }
 
     pub fn put_events(&self, events: &[Event]) -> Result<()> {
@@ -164,5 +330,39 @@ mod tests {
         assert_eq!(store.events_after(state.id, owner.public(), 2).unwrap(), events[2..]);
         assert_eq!(store.keys(state.id).unwrap(), [(0, key)]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn friends_outbox_dms_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db.redb")).unwrap();
+        let (a, b) = (iroh::SecretKey::generate().public(), iroh::SecretKey::generate().public());
+
+        let rec = FriendRecord { state: FriendState::Outgoing, since_ms: 1 };
+        store.put_friend(a, Some(rec)).unwrap();
+        assert_eq!(store.friends().unwrap(), [(a, rec)]);
+        store.put_friend(a, None).unwrap();
+        assert!(store.friends().unwrap().is_empty());
+
+        store.push_outbox(a, &Frame::FriendRequest { name: "x".into() }).unwrap();
+        store.push_outbox(a, &Frame::FriendRemove).unwrap();
+        store.push_outbox(b, &Frame::FriendRemove).unwrap();
+        assert_eq!(store.take_outbox(a).unwrap(), [Frame::FriendRequest { name: "x".into() }, Frame::FriendRemove]);
+        assert!(store.take_outbox(a).unwrap().is_empty());
+        assert_eq!(store.take_outbox(b).unwrap().len(), 1);
+
+        let owner = iroh::SecretKey::generate();
+        let (state, key, events) = ServerState::create(&owner, "dm");
+        store.add_server(state.id).unwrap();
+        store.put_events(&events).unwrap();
+        store.put_key(state.id, 0, &key).unwrap();
+        store.put_dm(state.id, a).unwrap();
+        assert_eq!(store.dms().unwrap(), [(state.id, a)]);
+        store.remove_server(state.id).unwrap();
+        assert!(store.servers().unwrap().is_empty() && store.events(state.id).unwrap().is_empty());
+        assert!(store.keys(state.id).unwrap().is_empty() && store.dms().unwrap().is_empty());
+
+        store.put_meta("x", &5u32).unwrap();
+        assert_eq!(store.meta::<u32>("x").unwrap(), Some(5));
     }
 }

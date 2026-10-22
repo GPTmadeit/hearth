@@ -5,6 +5,7 @@
 //! that only see QUIC/TLS ciphertext. Servers are replicated logs of signed
 //! events whose content is sealed under a per-epoch group key.
 
+pub mod blob;
 pub mod crypto;
 pub mod engine;
 pub mod event;
@@ -14,7 +15,10 @@ pub mod proto;
 pub mod state;
 pub mod store;
 
-pub use engine::{Config, Hearth, HostPolicy, ServerSummary, Update};
+pub use engine::{Config, FriendView, Hearth, HostPolicy, ServerSummary, Update, VoiceRoom};
+pub use blob::BlobRef;
+pub use event::Attachment;
+pub use store::FriendState;
 pub use iroh::RelayUrl;
 pub use media::{KIND_AUDIO, KIND_VIDEO, MAX_VIDEO_FRAME, MediaPacket, MediaSender, VoiceSession};
 pub use event::{ChannelKind, EventId, ServerId};

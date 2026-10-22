@@ -1,6 +1,6 @@
 [package]
 name = "hearth-media"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GPTmadeit/hearth"
@@ -8,6 +8,6 @@ repository = "https://github.com/GPTmadeit/hearth"
 [dependencies]
 anyhow = "1.0.104"
 cpal = "0.18.2"
-hearth-core = { version = "0.1.0", path = "../hearth-core" }
+hearth-core = { path = "../hearth-core" }
 hound = "3.5.1"
 opus = "0.4.0"

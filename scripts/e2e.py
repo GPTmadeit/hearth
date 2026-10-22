@@ -154,20 +154,66 @@ def main():
             assert m.group(1) == "0", f"{m.group(1)} corrupt frames"
             alice.send("/unlive")
 
+        def friends_and_dms():
+            alice.send("/friend bob")
+            bob.wait_for(r"alice sent you a friend request")
+            bob.send("/friend alice")
+            alice.wait_for(r"you and bob are friends")
+            bob.wait_for(r"you and alice are friends")
+            # The peer with the larger ID joins the DM the other one created.
+            joiner = alice if ids["alice"] > ids["bob"] else bob
+            other = "bob" if joiner is alice else "alice"
+            joiner.wait_for(rf"dm with {other} ready")
+            alice.send("/dm bob hello friend")
+            bob.wait_for(r"^\[dm alice\] hello friend$")
+            bob.send("/dm alice hey you")
+            alice.wait_for(r"^\[dm bob\] hey you$")
+
+        def reactions():
+            alice.send("react to this")
+            bob.wait_for(r"^<alice> react to this$")
+            bob.send("/react 🔥")
+            alice.wait_for(r"reactions on your message: 🔥1")
+
+        payload = os.urandom(3 * 1024 * 1024 + 123)  # spans several encrypted chunks
+        with open(os.path.join(WORK, "payload.bin"), "wb") as f:
+            f.write(payload)
+
+        def file_transfer():
+            alice.send(f"/attach {os.path.join(WORK, 'payload.bin')} here's a file")
+            bob.wait_for(r"^<alice> here's a file \[file payload\.bin")
+            bob.send(f"/save {os.path.join(WORK, 'bob-got')}")
+            bob.wait_for(r"^saved .*payload\.bin \(3145851 bytes\)$", timeout=120)
+            got = open(os.path.join(WORK, "bob-got", "payload.bin"), "rb").read()
+            assert got == payload, "downloaded file differs from the original"
+
+        photo = os.urandom(512 * 1024)
+        with open(os.path.join(WORK, "photo.jpg"), "wb") as f:
+            f.write(photo)
+
         def offline_delivery():
             bob.quit()
             alice.send("posted while bob was away")
-            time.sleep(4)  # reaches the node
+            alice.send(f"/attach {os.path.join(WORK, 'photo.jpg')} and a photo")
+            time.sleep(6)  # the node stores the message and fetches the file
             alice.quit()
             back = Peer("bob", "chat", "--name", "bob")
             peers.append(back)
             back.wait_for(r"^<alice> posted while bob was away$", timeout=120)
+            back.wait_for(r"^<alice> and a photo \[file photo\.jpg", timeout=60)
+            back.send(f"/save {os.path.join(WORK, 'from-node')}")
+            back.wait_for(r"^saved .*photo\.jpg", timeout=120)
+            got = open(os.path.join(WORK, "from-node", "photo.jpg"), "rb").read()
+            assert got == photo, "file from the node differs from the original"
 
         check("invite + server sync", server_and_invite)
         check("chat both ways", chat)
         check("voice channel presence", voice)
         check("screen-share frames, verified", screen_share)
-        check("offline delivery via blind node", offline_delivery)
+        check("friend request, accept, and DMs both ways", friends_and_dms)
+        check("reactions", reactions)
+        check("3 MB file transfer, byte-verified", file_transfer)
+        check("offline delivery of message and file via blind node", offline_delivery)
     finally:
         for p in peers:
             p.quit()
