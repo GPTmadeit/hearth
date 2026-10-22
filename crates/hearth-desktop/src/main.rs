@@ -345,8 +345,9 @@ fn video_channel(app: State<'_, App>, channel: Channel<InvokeResponseBody>) {
 }
 
 /// One encoded frame from the page's encoder. Byte 0 bit 0 marks a keyframe.
+/// Async so it runs off the UI thread.
 #[tauri::command]
-fn push_video(app: State<'_, App>, request: Request<'_>) -> Res<usize> {
+async fn push_video(app: State<'_, App>, request: Request<'_>) -> Res<usize> {
     let InvokeBody::Raw(frame) = request.body() else {
         return Err("expected raw bytes".into());
     };

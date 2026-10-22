@@ -394,11 +394,12 @@ impl Repl {
                 self.hearth.set_live(true).await?;
                 let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let (sender, flag) = (a.sender(), stop.clone());
-                tokio::spawn(async move {
+                // A plain OS thread, like a UI thread pushing encoded frames: send_frame
+                // must work outside the async runtime.
+                std::thread::spawn(move || {
                     let mut n: u32 = 0;
-                    let mut tick = tokio::time::interval(std::time::Duration::from_millis(33));
                     while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        tick.tick().await;
+                        std::thread::sleep(std::time::Duration::from_millis(33));
                         let key = n.is_multiple_of(60);
                         sender.send_frame(&test_frame(n, key), key);
                         n += 1;

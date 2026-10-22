@@ -156,10 +156,15 @@ impl Room {
 pub struct MediaHub {
     room: Mutex<Option<Room>>,
     sink: Mutex<Option<mpsc::Sender<MediaPacket>>>,
+    /// The engine's runtime, so frames can be sent from any thread (e.g. a UI thread).
+    runtime: Mutex<Option<tokio::runtime::Handle>>,
 }
 
 impl MediaHub {
     pub(crate) fn configure(&self, cfg: Option<RoomConfig>) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            self.runtime.lock().expect("media lock").get_or_insert(handle);
+        }
         let mut room = self.room.lock().expect("media lock");
         let Some(cfg) = cfg else {
             *room = None;
@@ -215,8 +220,9 @@ impl MediaHub {
 
     /// Sends one encoded video frame to each watcher on its own QUIC stream.
     /// Viewers who are falling behind skip non-key frames until they catch up.
-    /// Must be called from within a tokio runtime. Returns how many viewers it went to.
+    /// Safe to call from any thread. Returns how many viewers it went to.
     pub fn send_frame(&self, payload: &[u8], keyframe: bool) -> usize {
+        let Some(rt) = self.runtime.lock().expect("media lock").clone() else { return 0 };
         let mut guard = self.room.lock().expect("media lock");
         let Some(room) = guard.as_mut() else { return 0 };
         if room.watchers.is_empty() || payload.len() > MAX_VIDEO_FRAME {
@@ -232,7 +238,7 @@ impl MediaHub {
             }
             inflight.fetch_add(1, Ordering::Relaxed);
             let packet = packet.clone();
-            tokio::spawn(async move {
+            rt.spawn(async move {
                 if let Ok(mut s) = conn.open_uni().await
                     && s.write_all(&packet).await.is_ok()
                 {
