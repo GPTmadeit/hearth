@@ -1,7 +1,9 @@
 //! Real-time media transport for voice channels.
 //!
-//! Packets travel as QUIC datagrams on the existing peer connections, so
-//! there's no extra handshake and no retransmission delay. Each packet is
+//! Audio packets travel as QUIC datagrams on the existing peer connections,
+//! so there's no extra handshake and no retransmission delay. Video frames
+//! are too big for a datagram, so each one gets its own unidirectional QUIC
+//! stream: a lost packet delays only that frame, never the next. Each packet is
 //! additionally sealed with a key derived from the server's epoch key and the
 //! channel, so only members can decode media even if it is ever forwarded.
 //!
@@ -9,8 +11,12 @@
 //! where the plaintext is `kind(1) | seq(4) | payload`.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Mutex, mpsc},
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
 };
 
 use bytes::Bytes;
@@ -26,6 +32,12 @@ const HEADER: usize = 1 + 8 + 4 + 24;
 
 /// Opus voice frames.
 pub const KIND_AUDIO: u8 = 1;
+/// Encoded screen-share frames.
+pub const KIND_VIDEO: u8 = 2;
+
+/// Video frames allowed in flight per viewer before non-key frames are skipped.
+const MAX_INFLIGHT: usize = 4;
+pub const MAX_VIDEO_FRAME: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MediaPacket {
@@ -100,6 +112,8 @@ pub struct RoomConfig {
     pub keys: BTreeMap<u32, EpochKey>,
     /// Members currently in the channel with us, and their connections.
     pub peers: Vec<(PeerId, Connection)>,
+    /// Peers watching our stream.
+    pub watchers: Vec<PeerId>,
 }
 
 #[derive(Debug)]
@@ -109,8 +123,31 @@ struct Room {
     epoch: u32,
     keys: BTreeMap<u32, [u8; 32]>,
     peers: HashMap<PeerId, Connection>,
+    watchers: HashSet<PeerId>,
+    inflight: HashMap<PeerId, Arc<AtomicUsize>>,
     seq: u32,
     replay: HashMap<PeerId, Replay>,
+}
+
+impl Room {
+    fn seal(&mut self, kind: u8, payload: &[u8]) -> Option<Bytes> {
+        let key = self.keys.get(&self.epoch)?;
+        self.seq = self.seq.wrapping_add(1);
+        let mut plaintext = Vec::with_capacity(5 + payload.len());
+        plaintext.push(kind);
+        plaintext.extend_from_slice(&self.seq.to_be_bytes());
+        plaintext.extend_from_slice(payload);
+        let nonce = crypto::random_nonce();
+        let ct = crypto::seal(key, &nonce, &aad(&self.tag, self.epoch, &self.me), &plaintext);
+
+        let mut packet = Vec::with_capacity(HEADER + ct.len());
+        packet.push(VERSION);
+        packet.extend_from_slice(&self.tag);
+        packet.extend_from_slice(&self.epoch.to_be_bytes());
+        packet.extend_from_slice(&nonce);
+        packet.extend_from_slice(&ct);
+        Some(Bytes::from(packet))
+    }
 }
 
 /// Shared between the engine (which configures it) and media threads (which
@@ -131,16 +168,29 @@ impl MediaHub {
         let tag = room_tag(&cfg.server, &cfg.channel);
         let keys = cfg.keys.iter().map(|(e, k)| (*e, media_key(k, &cfg.server, &cfg.channel))).collect();
         let peers: HashMap<PeerId, Connection> = cfg.peers.into_iter().collect();
+        let watchers: HashSet<PeerId> = cfg.watchers.into_iter().filter(|w| peers.contains_key(w)).collect();
         match room.as_mut() {
             // Same room: keep our sequence counter and replay state.
             Some(r) if r.tag == tag => {
                 r.epoch = cfg.epoch;
                 r.keys = keys;
                 r.replay.retain(|p, _| peers.contains_key(p));
+                r.inflight.retain(|p, _| watchers.contains(p));
                 r.peers = peers;
+                r.watchers = watchers;
             }
             _ => {
-                *room = Some(Room { tag, me: cfg.me, epoch: cfg.epoch, keys, peers, seq: 0, replay: HashMap::new() })
+                *room = Some(Room {
+                    tag,
+                    me: cfg.me,
+                    epoch: cfg.epoch,
+                    keys,
+                    peers,
+                    watchers,
+                    inflight: HashMap::new(),
+                    seq: 0,
+                    replay: HashMap::new(),
+                })
             }
         }
     }
@@ -153,29 +203,44 @@ impl MediaHub {
     pub fn send(&self, kind: u8, payload: &[u8]) -> usize {
         let mut guard = self.room.lock().expect("media lock");
         let Some(room) = guard.as_mut() else { return 0 };
-        let Some(key) = room.keys.get(&room.epoch) else { return 0 };
-        room.seq = room.seq.wrapping_add(1);
-
-        let mut plaintext = Vec::with_capacity(5 + payload.len());
-        plaintext.push(kind);
-        plaintext.extend_from_slice(&room.seq.to_be_bytes());
-        plaintext.extend_from_slice(payload);
-        let nonce = crypto::random_nonce();
-        let ct = crypto::seal(key, &nonce, &aad(&room.tag, room.epoch, &room.me), &plaintext);
-
-        let mut packet = Vec::with_capacity(HEADER + ct.len());
-        packet.push(VERSION);
-        packet.extend_from_slice(&room.tag);
-        packet.extend_from_slice(&room.epoch.to_be_bytes());
-        packet.extend_from_slice(&nonce);
-        packet.extend_from_slice(&ct);
-        let packet = Bytes::from(packet);
-
+        let Some(packet) = room.seal(kind, payload) else { return 0 };
         let mut sent = 0;
         for conn in room.peers.values() {
             if conn.send_datagram(packet.clone()).is_ok() {
                 sent += 1;
             }
+        }
+        sent
+    }
+
+    /// Sends one encoded video frame to each watcher on its own QUIC stream.
+    /// Viewers who are falling behind skip non-key frames until they catch up.
+    /// Must be called from within a tokio runtime. Returns how many viewers it went to.
+    pub fn send_frame(&self, payload: &[u8], keyframe: bool) -> usize {
+        let mut guard = self.room.lock().expect("media lock");
+        let Some(room) = guard.as_mut() else { return 0 };
+        if room.watchers.is_empty() || payload.len() > MAX_VIDEO_FRAME {
+            return 0;
+        }
+        let Some(packet) = room.seal(KIND_VIDEO, payload) else { return 0 };
+        let mut sent = 0;
+        for w in room.watchers.clone() {
+            let Some(conn) = room.peers.get(&w).cloned() else { continue };
+            let inflight = room.inflight.entry(w).or_default().clone();
+            if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT && !keyframe {
+                continue;
+            }
+            inflight.fetch_add(1, Ordering::Relaxed);
+            let packet = packet.clone();
+            tokio::spawn(async move {
+                if let Ok(mut s) = conn.open_uni().await
+                    && s.write_all(&packet).await.is_ok()
+                {
+                    let _ = s.finish();
+                }
+                inflight.fetch_sub(1, Ordering::Relaxed);
+            });
+            sent += 1;
         }
         sent
     }
@@ -243,6 +308,11 @@ pub struct MediaSender {
 impl MediaSender {
     pub fn send(&self, kind: u8, payload: &[u8]) -> usize {
         self.hub.send(kind, payload)
+    }
+
+    /// See [`MediaHub::send_frame`].
+    pub fn send_frame(&self, payload: &[u8], keyframe: bool) -> usize {
+        self.hub.send_frame(payload, keyframe)
     }
 }
 

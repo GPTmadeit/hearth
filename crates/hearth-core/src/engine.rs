@@ -56,8 +56,10 @@ pub enum Update {
     Dm { peer: PeerId, body: String, sent_at_ms: u64 },
     Invited { server: ServerId, from: PeerId, name: String },
     Server { server: ServerId, change: Change },
-    /// Who is in a voice channel now.
-    Voice { server: ServerId, channel: EventId, peers: Vec<PeerId> },
+    /// Who is in a voice channel now, and who among them is streaming.
+    Voice { server: ServerId, channel: EventId, peers: Vec<PeerId>, live: Vec<PeerId> },
+    /// Someone started watching our stream: the next video frame should be a keyframe.
+    KeyframeRequested,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +118,7 @@ impl Hearth {
             media,
             voice: HashMap::new(),
             my_voice: None,
+            watchers: HashSet::new(),
             updates,
             inbox: inbox.clone(),
             endpoint: endpoint.clone(),
@@ -220,12 +223,22 @@ impl Hearth {
         self.call(|e| e.voice_leave()).await
     }
 
+    /// Starts or stops announcing that we're streaming our screen.
+    pub async fn set_live(&self, live: bool) -> Result<()> {
+        self.call(move |e| e.set_live(live)).await?
+    }
+
+    /// Asks `streamer` (in our voice channel) to start or stop sending us their stream.
+    pub async fn watch(&self, streamer: PeerId, on: bool) -> Result<()> {
+        self.call(move |e| e.watch(streamer, on)).await?
+    }
+
     /// Who's in each voice channel of `server` right now.
     pub async fn voice_state(&self, server: ServerId) -> Result<HashMap<EventId, Vec<PeerId>>> {
         self.call(move |e| {
             let mut out: HashMap<EventId, Vec<PeerId>> = HashMap::new();
-            for (p, c) in e.voice.get(&server).into_iter().flatten() {
-                out.entry(*c).or_default().push(*p);
+            for (p, slot) in e.voice.get(&server).into_iter().flatten() {
+                out.entry(slot.channel).or_default().push(*p);
             }
             out
         })
@@ -262,6 +275,12 @@ struct PeerConn {
     id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VoiceSlot {
+    channel: EventId,
+    live: bool,
+}
+
 struct Engine {
     secret: SecretKey,
     name: String,
@@ -273,8 +292,10 @@ struct Engine {
     dialing: HashSet<PeerId>,
     media: Arc<MediaHub>,
     /// Per server: which voice channel each connected member is in.
-    voice: HashMap<ServerId, HashMap<PeerId, EventId>>,
+    voice: HashMap<ServerId, HashMap<PeerId, VoiceSlot>>,
     my_voice: Option<(ServerId, EventId)>,
+    /// Peers watching our screen stream.
+    watchers: HashSet<PeerId>,
     updates: mpsc::UnboundedSender<Update>,
     inbox: mpsc::UnboundedSender<Inbox>,
     endpoint: Endpoint,
@@ -404,7 +425,9 @@ impl Engine {
         if let Some((server, channel)) = self.my_voice
             && self.servers[&server].is_member(&peer)
         {
-            self.send_to(&peer, Frame::Voice { server, channel: Some(channel) });
+            let me = self.me();
+            let live = self.voice.get(&server).and_then(|r| r.get(&me)).is_some_and(|s| s.live);
+            self.send_to(&peer, Frame::Voice { server, channel: Some(channel), live });
         }
         self.refresh_media();
     }
@@ -435,11 +458,12 @@ impl Engine {
                     None => self.emit(Update::Invited { server, from: peer, name }),
                 }
             }
-            Frame::Voice { server, channel } => {
+            Frame::Voice { server, channel, live } => {
                 if self.servers.get(&server).is_some_and(|s| s.is_member(&peer)) {
-                    self.set_voice(Some(server), peer, channel);
+                    self.set_voice(Some(server), peer, channel.map(|channel| VoiceSlot { channel, live }));
                 }
             }
+            Frame::Watch { server, on } => self.on_watch(peer, server, on),
             Frame::Removed { server } => {
                 let me = self.me();
                 if self.servers.get(&server).is_some_and(|s| s.owner() == Some(peer)) {
@@ -700,20 +724,58 @@ impl Engine {
         self.media.set_sink(Some(tx));
         self.my_voice = Some((server, channel));
         let me = self.me();
-        self.set_voice(Some(server), me, Some(channel));
+        self.set_voice(Some(server), me, Some(VoiceSlot { channel, live: false }));
         Ok(VoiceSession { hub: self.media.clone(), incoming: rx })
     }
 
     fn voice_leave(&mut self) {
         let Some((server, _)) = self.my_voice.take() else { return };
         self.media.set_sink(None);
+        self.watchers.clear();
         let me = self.me();
         self.set_voice(Some(server), me, None);
     }
 
-    /// Records `peer`'s voice channel in `server` (or in every server when
+    fn set_live(&mut self, live: bool) -> Result<()> {
+        let (server, channel) = self.my_voice.context("join a voice channel first")?;
+        if !live {
+            self.watchers.clear();
+        }
+        let me = self.me();
+        self.set_voice(Some(server), me, Some(VoiceSlot { channel, live }));
+        Ok(())
+    }
+
+    fn watch(&mut self, streamer: PeerId, on: bool) -> Result<()> {
+        let (server, channel) = self.my_voice.context("join the voice channel first")?;
+        let slot = self.voice.get(&server).and_then(|r| r.get(&streamer)).copied();
+        if on && !slot.is_some_and(|s| s.channel == channel && s.live) {
+            bail!("{} isn't streaming in this channel", streamer.fmt_short());
+        }
+        self.send_to(&streamer, Frame::Watch { server, on });
+        Ok(())
+    }
+
+    fn on_watch(&mut self, viewer: PeerId, server: ServerId, on: bool) {
+        let Some((my_server, channel)) = self.my_voice else { return };
+        let me = self.me();
+        let live = self.voice.get(&my_server).and_then(|r| r.get(&me)).is_some_and(|s| s.live);
+        let in_room = self.voice.get(&my_server).and_then(|r| r.get(&viewer)).is_some_and(|s| s.channel == channel);
+        if my_server != server || !live || !in_room {
+            return;
+        }
+        let changed = if on { self.watchers.insert(viewer) } else { self.watchers.remove(&viewer) };
+        if changed {
+            self.refresh_media();
+            if on {
+                self.emit(Update::KeyframeRequested);
+            }
+        }
+    }
+
+    /// Records `peer`'s voice slot in `server` (or in every server when
     /// `None`), tells the UI, and for our own moves tells other members.
-    fn set_voice(&mut self, server: Option<ServerId>, peer: PeerId, channel: Option<EventId>) {
+    fn set_voice(&mut self, server: Option<ServerId>, peer: PeerId, slot: Option<VoiceSlot>) {
         let servers: Vec<ServerId> = match server {
             Some(s) => vec![s],
             None => self.voice.keys().copied().collect(),
@@ -721,22 +783,31 @@ impl Engine {
         for sid in servers {
             let rooms = self.voice.entry(sid).or_default();
             let before = rooms.get(&peer).copied();
-            if before == channel {
+            if before == slot {
                 continue;
             }
-            match channel {
-                Some(c) => rooms.insert(peer, c),
+            match slot {
+                Some(s) => rooms.insert(peer, s),
                 None => rooms.remove(&peer),
             };
-            for c in [before, channel].into_iter().flatten() {
-                let peers = rooms.iter().filter(|(_, rc)| **rc == c).map(|(p, _)| *p).collect();
-                let _ = self.updates.send(Update::Voice { server: sid, channel: c, peers });
+            if slot.is_none_or(|s| !s.live) {
+                self.watchers.remove(&peer);
+            }
+            let rooms = &self.voice[&sid];
+            let mut channels: Vec<EventId> = [before, slot].into_iter().flatten().map(|s| s.channel).collect();
+            channels.dedup();
+            for c in channels {
+                let here = rooms.iter().filter(|(_, s)| s.channel == c);
+                let peers = here.clone().map(|(p, _)| *p).collect();
+                let live = here.filter(|(_, s)| s.live).map(|(p, _)| *p).collect();
+                let _ = self.updates.send(Update::Voice { server: sid, channel: c, peers, live });
             }
             if peer == self.me()
                 && let Some(s) = self.servers.get(&sid)
             {
+                let frame = Frame::Voice { server: sid, channel: slot.map(|s| s.channel), live: slot.is_some_and(|s| s.live) };
                 for m in s.members() {
-                    self.send_to(&m, Frame::Voice { server: sid, channel });
+                    self.send_to(&m, frame.clone());
                 }
             }
         }
@@ -756,7 +827,7 @@ impl Engine {
             .get(&sid)
             .into_iter()
             .flatten()
-            .filter(|(p, c)| **c == channel && **p != me && s.is_member(p))
+            .filter(|(p, slot)| slot.channel == channel && **p != me && s.is_member(p))
             .filter_map(|(p, _)| self.peers.get(p).map(|pc| (*p, pc.conn.clone())))
             .collect();
         self.media.configure(Some(RoomConfig {
@@ -766,6 +837,7 @@ impl Engine {
             epoch: s.epoch(),
             keys: s.keys().clone(),
             peers,
+            watchers: self.watchers.iter().copied().collect(),
         }));
     }
 
@@ -832,9 +904,22 @@ async fn drive(
     };
 
     let datagrams = conn.clone();
+    let dmedia = media.clone();
     tokio::spawn(async move {
         while let Ok(data) = datagrams.read_datagram().await {
-            media.receive(peer, &data);
+            dmedia.receive(peer, &data);
+        }
+    });
+    // Each video frame arrives on its own unidirectional stream.
+    let streams = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(mut recv) = streams.accept_uni().await {
+            let media = media.clone();
+            tokio::spawn(async move {
+                if let Ok(data) = recv.read_to_end(crate::media::MAX_VIDEO_FRAME + 1024).await {
+                    media.receive(peer, &data);
+                }
+            });
         }
     });
 

@@ -30,8 +30,11 @@ pub enum Frame {
     Invite { server: ServerId, name: String },
     /// The owner removed the receiver from a server. Trusted only from the owner.
     Removed { server: ServerId },
-    /// Which voice channel the sender is in (`None` = left voice). Live-only state.
-    Voice { server: ServerId, channel: Option<EventId> },
+    /// Which voice channel the sender is in (`None` = left voice), and whether
+    /// they're streaming their screen. Live-only state.
+    Voice { server: ServerId, channel: Option<EventId>, live: bool },
+    /// The sender wants (or no longer wants) the receiver's screen stream.
+    Watch { server: ServerId, on: bool },
     /// A direct message, delivered only while both peers are online.
     Dm { body: String, sent_at_ms: u64 },
 }

@@ -20,7 +20,7 @@ use cpal::{
     FromSample, Sample, SampleFormat, SizedSample, StreamConfig,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use hearth_core::{KIND_AUDIO, MediaSender, PeerId, VoiceSession};
+use hearth_core::{KIND_AUDIO, MediaPacket, MediaSender, PeerId, VoiceSession};
 
 pub const RATE: u32 = 48_000;
 const FRAME: usize = 960;
@@ -48,11 +48,13 @@ pub struct AudioOptions {
     pub output: Output,
     /// Frames quieter than this (dBFS) aren't sent.
     pub gate_db: f32,
+    /// Receives non-audio media (screen-share video) arriving on the session.
+    pub on_media: Option<Box<dyn Fn(MediaPacket) + Send>>,
 }
 
 impl Default for AudioOptions {
     fn default() -> Self {
-        Self { input: Input::Microphone, output: Output::Speakers, gate_db: -50.0 }
+        Self { input: Input::Microphone, output: Output::Speakers, gate_db: -50.0, on_media: None }
     }
 }
 
@@ -75,6 +77,7 @@ impl Controls {
 /// A running voice connection. Dropping it stops all audio.
 pub struct Audio {
     pub controls: Arc<Controls>,
+    sender: MediaSender,
     /// Non-fatal problems, e.g. no microphone (we still listen).
     pub warnings: Vec<String>,
     mixer: Arc<Mutex<Mixer>>,
@@ -89,6 +92,7 @@ impl Audio {
         let stop = Arc::new(AtomicBool::new(false));
         let captured = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let (sender, incoming) = session.split();
+        let on_media = opts.on_media;
         let mut threads = Vec::new();
         let mut warnings = Vec::new();
 
@@ -114,7 +118,7 @@ impl Audio {
 
         // Encoder: pulls 20 ms frames (from the mic buffer or a tone) and sends them.
         {
-            let (controls, stop) = (controls.clone(), stop.clone());
+            let (controls, stop, sender) = (controls.clone(), stop.clone(), sender.clone());
             let tone = match opts.input {
                 Input::Tone { hz } => Some(hz),
                 Input::Microphone => None,
@@ -134,7 +138,11 @@ impl Audio {
                 while !stop.load(Ordering::Relaxed) {
                     match incoming.recv_timeout(Duration::from_millis(100)) {
                         Ok(p) if p.kind == KIND_AUDIO => mixer.lock().expect("mixer").push(p.from, p.seq, &p.payload),
-                        Ok(_) => {}
+                        Ok(p) => {
+                            if let Some(f) = &on_media {
+                                f(p);
+                            }
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -151,7 +159,12 @@ impl Audio {
             })?);
         }
 
-        Ok(Self { controls, warnings, mixer, stop, threads })
+        Ok(Self { controls, sender, warnings, mixer, stop, threads })
+    }
+
+    /// For sending other media (screen share) into the same voice session.
+    pub fn sender(&self) -> MediaSender {
+        self.sender.clone()
     }
 
     /// Recent loudness per remote speaker (dBFS), for "who's talking" indicators.

@@ -39,6 +39,9 @@ enum Cmd {
         /// Write voice audio to this WAV file instead of the speakers.
         #[arg(long, value_name = "FILE")]
         record: Option<PathBuf>,
+        /// /live streams synthetic frames, and received frames are verified and counted.
+        #[arg(long)]
+        video_test: bool,
     },
     /// Run an always-on storage node. It stores and forwards servers'
     /// encrypted events for offline delivery, but never holds their keys.
@@ -59,6 +62,7 @@ commands:
   /host <node>             add a storage node    /unhost <node>       remove it
   /voice [channel]         join voice           /leave               leave voice
   /mute  /deafen           toggle mic/sound      /dm <peer> <text>    direct message
+  /live  /unlive           stream (--video-test) /watch <peer>        watch a stream
   /peers                   who's online
   /history [n]             recent messages       /id                  your peer id
   /quit
@@ -75,12 +79,13 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Id => println!("{}", secret.public()),
-        Cmd::Chat { name, peers, tone, record } => {
+        Cmd::Chat { name, peers, tone, record, video_test } => {
             let cfg = Config { secret, name, data_dir, relay: cli.relay, host: None };
             let (hearth, updates) = Hearth::start(cfg).await?;
             let mut repl = Repl::new(hearth);
             repl.tone = tone;
             repl.record = record;
+            repl.video_test = video_test;
             repl.run(updates, peers).await?;
         }
         Cmd::Node { allow } => {
@@ -115,6 +120,37 @@ async fn run_node(cfg: Config) -> Result<()> {
     Ok(())
 }
 
+const TEST_FRAME: usize = 50_000;
+
+/// A frame whose bytes are derived from its number, so receivers can verify it.
+fn test_frame(n: u32, key: bool) -> Vec<u8> {
+    let mut f = Vec::with_capacity(TEST_FRAME);
+    f.push(key as u8);
+    f.extend_from_slice(&n.to_be_bytes());
+    f.extend((0..TEST_FRAME - 5).map(|i| (i as u32).wrapping_mul(31).wrapping_add(n) as u8));
+    f
+}
+
+fn video_test_receiver() -> Box<dyn Fn(hearth_core::MediaPacket) + Send> {
+    // (frames received, frames that failed verification)
+    let state = std::sync::Mutex::new((0u32, 0u32));
+    Box::new(move |p| {
+        if p.kind != hearth_core::KIND_VIDEO || p.payload.len() < 5 {
+            return;
+        }
+        let n = u32::from_be_bytes(p.payload[1..5].try_into().expect("4 bytes"));
+        let ok = p.payload == test_frame(n, p.payload[0] == 1);
+        let mut s = state.lock().expect("video stats");
+        s.0 += 1;
+        if !ok {
+            s.1 += 1;
+        }
+        if s.0 % 30 == 0 {
+            println!("[video] {} frames from {} ({} KB each), {} corrupt", s.0, p.from.fmt_short(), p.payload.len() / 1000, s.1);
+        }
+    })
+}
+
 struct Repl {
     hearth: Hearth,
     names: HashMap<PeerId, String>,
@@ -123,11 +159,13 @@ struct Repl {
     audio: Option<Audio>,
     tone: Option<f32>,
     record: Option<PathBuf>,
+    video_test: bool,
+    streaming: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Repl {
     fn new(hearth: Hearth) -> Self {
-        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None }
+        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None, video_test: false, streaming: None }
     }
 
     async fn run(mut self, mut updates: tokio::sync::mpsc::UnboundedReceiver<Update>, peers: Vec<PeerId>) -> Result<()> {
@@ -331,6 +369,7 @@ impl Repl {
                 let opts = AudioOptions {
                     input: self.tone.map_or(Input::Microphone, |hz| Input::Tone { hz }),
                     output: self.record.clone().map_or(Output::Speakers, Output::Wav),
+                    on_media: self.video_test.then(video_test_receiver),
                     ..Default::default()
                 };
                 match Audio::start(session, opts) {
@@ -347,7 +386,42 @@ impl Repl {
                 }
                 println!("🔊 joined {} (/mute, /deafen, /leave)", ch.name);
             }
+            "/live" => {
+                let a = self.audio.as_ref().context("join voice first")?;
+                if !self.video_test {
+                    bail!("the CLI has no screen capture; run with --video-test to stream synthetic frames");
+                }
+                self.hearth.set_live(true).await?;
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let (sender, flag) = (a.sender(), stop.clone());
+                tokio::spawn(async move {
+                    let mut n: u32 = 0;
+                    let mut tick = tokio::time::interval(std::time::Duration::from_millis(33));
+                    while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        tick.tick().await;
+                        let key = n % 60 == 0;
+                        sender.send_frame(&test_frame(n, key), key);
+                        n += 1;
+                    }
+                });
+                self.streaming = Some(stop);
+                println!("streaming synthetic video");
+            }
+            "/unlive" => {
+                if let Some(s) = self.streaming.take() {
+                    s.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.hearth.set_live(false).await?;
+            }
+            "/watch" => {
+                let peer = self.resolve_peer(rest).await?;
+                self.hearth.watch(peer, true).await?;
+                println!("watching {}", self.who(&peer));
+            }
             "/leave" => {
+                if let Some(s) = self.streaming.take() {
+                    s.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 self.audio = None;
                 self.hearth.voice_leave().await?;
                 println!("left voice");
@@ -396,7 +470,8 @@ impl Repl {
                 }
             }
             Update::Server { server, change } => self.server_change(server, change).await,
-            Update::Voice { server, channel, peers } => {
+            Update::KeyframeRequested => {}
+            Update::Voice { server, channel, peers, .. } => {
                 let Some(s) = self.hearth.servers().await.ok().and_then(|v| v.into_iter().find(|s| s.id == server)) else {
                     return;
                 };

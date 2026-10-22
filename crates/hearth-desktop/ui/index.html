@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hearth</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <nav id="rail" aria-label="Servers"></nav>
+      <aside id="sidebar">
+        <header id="server-header"></header>
+        <div id="channels"></div>
+        <section id="voice-panel" hidden></section>
+        <footer id="user-panel"></footer>
+      </aside>
+      <main id="main"></main>
+      <aside id="members" aria-label="Members"></aside>
+    </div>
+    <div id="modal-root"></div>
+    <div id="toasts" aria-live="polite"></div>
+    <script src="app.js" type="module"></script>
+  </body>
+</html>
