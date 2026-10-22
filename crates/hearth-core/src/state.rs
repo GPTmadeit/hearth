@@ -43,6 +43,8 @@ pub enum Change {
     Message(ChatMessage),
     MemberAdded(PeerId),
     MemberRemoved(PeerId),
+    HostAdded(PeerId),
+    HostRemoved(PeerId),
     Epoch(u32),
 }
 
@@ -78,6 +80,9 @@ pub struct ServerState {
     /// (owner seq, epoch, key hash), epoch 0 first.
     epochs: Vec<(u64, u32, [u8; 32])>,
     keys: BTreeMap<u32, EpochKey>,
+    hosts: Vec<PeerId>,
+    /// Hosts never get keys, so they shouldn't hold sealed events in memory waiting for one.
+    blind: bool,
     unverified_keys: Vec<(u32, EpochKey)>,
     pending: Vec<Event>,
     locked: Vec<Event>,
@@ -95,6 +100,8 @@ impl ServerState {
             membership: HashMap::new(),
             epochs: Vec::new(),
             keys: BTreeMap::new(),
+            hosts: Vec::new(),
+            blind: false,
             unverified_keys: Vec::new(),
             pending: Vec::new(),
             locked: Vec::new(),
@@ -123,6 +130,27 @@ impl ServerState {
             events.extend(state.ingest(vec![e]).accepted);
         }
         (state, key, events)
+    }
+
+    /// Marks this replica as a storage host: sealed events are validated and kept on disk only.
+    pub fn set_blind(&mut self) {
+        self.blind = true;
+        self.locked.clear();
+    }
+
+    pub fn hosts(&self) -> &[PeerId] {
+        &self.hosts
+    }
+
+    pub fn is_host(&self, peer: &PeerId) -> bool {
+        self.hosts.contains(peer)
+    }
+
+    /// Everyone we exchange events with: members and hosts.
+    pub fn sync_peers(&self) -> Vec<PeerId> {
+        let mut out = self.members();
+        out.extend(self.hosts.iter().filter(|h| !out.contains(h)).copied().collect::<Vec<_>>());
+        out
     }
 
     pub fn owner(&self) -> Option<PeerId> {
@@ -334,6 +362,16 @@ impl ServerState {
                     self.membership.entry(*peer).or_default().push((e.seq, m));
                     out.changes.push(Change::MemberRemoved(*peer));
                 }
+                AdminOp::AddHost { peer } => {
+                    if !self.hosts.contains(peer) {
+                        self.hosts.push(*peer);
+                    }
+                    out.changes.push(Change::HostAdded(*peer));
+                }
+                AdminOp::RemoveHost { peer } => {
+                    self.hosts.retain(|h| h != peer);
+                    out.changes.push(Change::HostRemoved(*peer));
+                }
                 AdminOp::Rotate { epoch, key_hash } => {
                     self.epochs.push((e.seq, *epoch, *key_hash));
                     out.changes.push(Change::Epoch(*epoch));
@@ -351,7 +389,9 @@ impl ServerState {
     fn reveal(&mut self, e: Event, changes: &mut Vec<Change>) {
         let Body::Sealed { epoch, .. } = &e.body else { return };
         let Some(key) = self.keys.get(epoch) else {
-            self.locked.push(e);
+            if !self.blind {
+                self.locked.push(e);
+            }
             return;
         };
         let Ok(Some(content)) = e.open(key) else { return };
@@ -487,6 +527,25 @@ mod tests {
         assert!(post.open(&key0).is_err());
         s.ingest(vec![post]);
         assert_eq!(bodies(&s), ["pre-removal", "after"]);
+    }
+
+    #[test]
+    fn blind_host_replicates_without_reading() {
+        let (owner, mut s, _, mut log) = setup();
+        let node = SecretKey::generate();
+        let add = s.author_admin(&owner, AdminOp::AddHost { peer: node.public() }).unwrap();
+        log.extend(s.ingest(vec![add]).accepted);
+        let msg = say(&s, &owner, "for members only");
+        log.extend(s.ingest(vec![msg]).accepted);
+
+        let mut host = ServerState::new(s.id);
+        host.set_blind();
+        assert_eq!(host.ingest(log).accepted.len(), 6, "host validates and keeps everything");
+        assert!(host.is_host(&node.public()));
+        assert!(!host.is_member(&node.public()));
+        assert!(host.channels.is_empty() && host.messages.is_empty());
+        assert!(host.author_content(&node, &Content::Rename { name: "x".into() }).is_err());
+        assert!(s.sync_peers().contains(&node.public()));
     }
 
     #[test]

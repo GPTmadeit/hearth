@@ -74,6 +74,9 @@ pub enum AdminOp {
     Add { peer: PeerId },
     /// `through_seq` is the last of the peer's events the owner accepts.
     Remove { peer: PeerId, through_seq: u64 },
+    /// A storage node that syncs ciphertext but never receives keys or posts.
+    AddHost { peer: PeerId },
+    RemoveHost { peer: PeerId },
     /// A new epoch key exists; members receive it out of band via key grants.
     Rotate { epoch: u32, key_hash: [u8; 32] },
 }

@@ -3,7 +3,8 @@ use std::{collections::HashMap, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use hearth_core::{
-    Change, ChannelKind, Config, EventId, Hearth, PeerId, ServerId, ServerSummary, Update, identity,
+    Change, ChannelKind, Config, EventId, Hearth, HostPolicy, PeerId, RelayUrl, ServerId, ServerSummary, Update,
+    identity,
 };
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -13,6 +14,9 @@ struct Cli {
     /// Where your identity and data live (defaults to the platform data dir).
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
+    /// Use your own relay (e.g. https://relay.example.com) instead of the public ones.
+    #[arg(long, global = true)]
+    relay: Option<RelayUrl>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -29,6 +33,13 @@ enum Cmd {
         /// Peer IDs to dial on startup.
         peers: Vec<PeerId>,
     },
+    /// Run an always-on storage node. It stores and forwards servers'
+    /// encrypted events for offline delivery, but never holds their keys.
+    Node {
+        /// Only host servers for these owners (default: anyone who asks).
+        #[arg(long)]
+        allow: Vec<PeerId>,
+    },
 }
 
 const HELP: &str = "\
@@ -38,6 +49,7 @@ commands:
   /channel <name> [voice]  create a channel      /members             list members
   /invite <peer>           invite to server      /kick <peer>         remove + rotate key
   /invites                 pending invites       /accept <n>          join an invite
+  /host <node>             add a storage node    /unhost <node>       remove it
   /dm <peer> <text>        direct message        /peers               who's online
   /history [n]             recent messages       /id                  your peer id
   /quit
@@ -55,10 +67,39 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Id => println!("{}", secret.public()),
         Cmd::Chat { name, peers } => {
-            let (hearth, updates) = Hearth::start(Config { secret, name, data_dir }).await?;
+            let cfg = Config { secret, name, data_dir, relay: cli.relay, host: None };
+            let (hearth, updates) = Hearth::start(cfg).await?;
             Repl::new(hearth).run(updates, peers).await?;
         }
+        Cmd::Node { allow } => {
+            let host = Some(HostPolicy { allow });
+            let cfg = Config { secret, name: "hearth-node".into(), data_dir, relay: cli.relay, host };
+            run_node(cfg).await?;
+        }
     }
+    Ok(())
+}
+
+async fn run_node(cfg: Config) -> Result<()> {
+    let (hearth, mut updates) = Hearth::start(cfg).await?;
+    println!("node id: {}", hearth.id());
+    hearth.online().await;
+    println!("online. owners can now run `/host {}`", hearth.id());
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            Some(u) = updates.recv() => match u {
+                Update::Invited { server, from, .. } => println!("hosting {} for {}", server.short(), from.fmt_short()),
+                Update::PeerOnline { peer, name } => println!("+ {name} {}", peer.fmt_short()),
+                Update::PeerOffline { peer } => println!("- {}", peer.fmt_short()),
+                Update::Server { server, change: Change::HostRemoved(p) } if p == hearth.id() => {
+                    println!("no longer hosting {}", server.short())
+                }
+                _ => {}
+            },
+        }
+    }
+    hearth.shutdown().await;
     Ok(())
 }
 
@@ -216,6 +257,10 @@ impl Repl {
                     let dot = if online.iter().any(|(p, _)| p == m) || *m == self.hearth.id() { "●" } else { "○" };
                     println!("  {dot} {}{crown}  {}", self.who(m), m.fmt_short());
                 }
+                for h in &s.hosts {
+                    let dot = if online.iter().any(|(p, _)| p == h) { "●" } else { "○" };
+                    println!("  {dot} [node] {}", h.fmt_short());
+                }
             }
             "/invite" => {
                 let s = self.current_server().await?;
@@ -228,6 +273,17 @@ impl Repl {
                 let peer = self.resolve_peer(rest).await?;
                 self.hearth.kick(s.id, peer).await?;
                 println!("removed {}; rotated server key", self.who(&peer));
+            }
+            "/host" => {
+                let s = self.current_server().await?;
+                let peer: PeerId = rest.parse().context("usage: /host <node-id>")?;
+                self.hearth.add_host(s.id, peer).await?;
+                println!("asked {} to host {}", peer.fmt_short(), s.name.as_deref().unwrap_or("?"));
+            }
+            "/unhost" => {
+                let s = self.current_server().await?;
+                let peer = self.resolve_peer(rest).await?;
+                self.hearth.remove_host(s.id, peer).await?;
             }
             "/invites" => {
                 if self.invites.is_empty() {
@@ -331,6 +387,8 @@ impl Repl {
                 }
             }
             Change::Epoch(e) => println!("* {sname} rotated to key epoch {e}"),
+            Change::HostAdded(p) => println!("* {sname} is now stored on node {}", p.fmt_short()),
+            Change::HostRemoved(p) => println!("* node {} no longer stores {sname}", p.fmt_short()),
         }
     }
 }

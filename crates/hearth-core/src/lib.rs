@@ -13,7 +13,8 @@ pub mod proto;
 pub mod state;
 pub mod store;
 
-pub use engine::{Config, Hearth, ServerSummary, Update};
+pub use engine::{Config, Hearth, HostPolicy, ServerSummary, Update};
+pub use iroh::RelayUrl;
 pub use event::{ChannelKind, EventId, ServerId};
 pub use iroh::{EndpointId as PeerId, SecretKey};
 pub use state::{Change, Channel, ChatMessage};

@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use iroh::{
-    Endpoint, EndpointId as PeerId, SecretKey,
+    Endpoint, EndpointId as PeerId, RelayMode, RelayUrl, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
@@ -32,6 +32,16 @@ pub struct Config {
     pub secret: SecretKey,
     pub name: String,
     pub data_dir: PathBuf,
+    /// Use this relay instead of the public n0 relays.
+    pub relay: Option<RelayUrl>,
+    /// Run as a storage host: accept hosting requests and keep servers blind.
+    pub host: Option<HostPolicy>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HostPolicy {
+    /// Owners allowed to make us host their servers. Empty means anyone.
+    pub allow: Vec<PeerId>,
 }
 
 /// Something the UI should know about.
@@ -50,6 +60,7 @@ pub struct ServerSummary {
     pub name: Option<String>,
     pub owner: Option<PeerId>,
     pub members: Vec<PeerId>,
+    pub hosts: Vec<PeerId>,
     pub channels: Vec<Channel>,
     pub epoch: u32,
 }
@@ -75,7 +86,11 @@ pub struct Hearth {
 impl Hearth {
     pub async fn start(cfg: Config) -> Result<(Self, mpsc::UnboundedReceiver<Update>)> {
         let store = Store::open(&cfg.data_dir.join("hearth.redb"))?;
-        let endpoint = Endpoint::builder(presets::N0).secret_key(cfg.secret.clone()).bind().await?;
+        let mut builder = Endpoint::builder(presets::N0).secret_key(cfg.secret.clone());
+        if let Some(url) = cfg.relay {
+            builder = builder.relay_mode(RelayMode::Custom(url.into()));
+        }
+        let endpoint = builder.bind().await?;
         let (inbox, inbox_rx) = mpsc::unbounded_channel();
         let (updates, updates_rx) = mpsc::unbounded_channel();
 
@@ -85,6 +100,7 @@ impl Hearth {
         let mut engine = Engine {
             secret: cfg.secret,
             name: cfg.name,
+            host: cfg.host,
             store,
             servers: HashMap::new(),
             persisted_keys: HashSet::new(),
@@ -148,6 +164,15 @@ impl Hearth {
         self.call(move |e| e.invite(server, peer)).await?
     }
 
+    /// Asks a storage node to host `server`'s ciphertext.
+    pub async fn add_host(&self, server: ServerId, peer: PeerId) -> Result<()> {
+        self.call(move |e| e.add_host(server, peer)).await?
+    }
+
+    pub async fn remove_host(&self, server: ServerId, peer: PeerId) -> Result<()> {
+        self.call(move |e| e.remove_host(server, peer)).await?
+    }
+
     pub async fn kick(&self, server: ServerId, peer: PeerId) -> Result<()> {
         self.call(move |e| e.kick(server, peer)).await?
     }
@@ -209,6 +234,7 @@ struct PeerConn {
 struct Engine {
     secret: SecretKey,
     name: String,
+    host: Option<HostPolicy>,
     store: Store,
     servers: HashMap<ServerId, ServerState>,
     persisted_keys: HashSet<(ServerId, u32)>,
@@ -225,9 +251,17 @@ impl Engine {
         self.secret.public()
     }
 
+    fn new_state(&self, id: ServerId) -> ServerState {
+        let mut s = ServerState::new(id);
+        if self.host.is_some() {
+            s.set_blind();
+        }
+        s
+    }
+
     fn load(&mut self) -> Result<()> {
         for id in self.store.servers()? {
-            let mut state = ServerState::new(id);
+            let mut state = self.new_state(id);
             for (epoch, key) in self.store.keys(id)? {
                 state.offer_key(epoch, key);
                 self.persisted_keys.insert((id, epoch));
@@ -298,7 +332,7 @@ impl Engine {
 
     /// Keeps a connection to every member of every server we're in.
     fn reconnect(&mut self) {
-        let wanted: HashSet<PeerId> = self.servers.values().flat_map(|s| s.members()).collect();
+        let wanted: HashSet<PeerId> = self.servers.values().flat_map(|s| s.sync_peers()).collect();
         for peer in wanted {
             self.dial(peer);
         }
@@ -326,7 +360,7 @@ impl Engine {
         for id in ids {
             let s = &self.servers[&id];
             // Share a server's existence only with its members, or with whoever we're joining through.
-            if s.is_member(&peer) || s.owner().is_none() {
+            if s.is_member(&peer) || s.is_host(&peer) || s.owner().is_none() {
                 self.send_have(&peer, id);
             }
         }
@@ -346,8 +380,16 @@ impl Engine {
             Frame::Hello { .. } => {}
             Frame::Dm { body, sent_at_ms } => self.emit(Update::Dm { peer, body, sent_at_ms }),
             Frame::Invite { server, name } => {
-                if !self.servers.contains_key(&server) {
-                    self.emit(Update::Invited { server, from: peer, name });
+                if self.servers.contains_key(&server) {
+                    return Ok(());
+                }
+                match &self.host {
+                    Some(policy) if policy.allow.is_empty() || policy.allow.contains(&peer) => {
+                        self.join(server, peer)?;
+                        self.emit(Update::Invited { server, from: peer, name });
+                    }
+                    Some(_) => {}
+                    None => self.emit(Update::Invited { server, from: peer, name }),
                 }
             }
             Frame::Removed { server } => {
@@ -380,7 +422,7 @@ impl Engine {
 
     fn on_have(&mut self, peer: PeerId, server: ServerId, theirs: Vec<(PeerId, u64)>, epochs: Vec<u32>) -> Result<()> {
         let Some(s) = self.servers.get(&server) else { return Ok(()) };
-        if !s.is_member(&peer) {
+        if !s.is_member(&peer) && !s.is_host(&peer) {
             return Ok(());
         }
         let theirs: HashMap<PeerId, u64> = theirs.into_iter().collect();
@@ -398,7 +440,8 @@ impl Engine {
         for chunk in missing.chunks(BATCH) {
             self.send_to(&peer, Frame::Events(chunk.to_vec()));
         }
-        for (epoch, key) in s.keys() {
+        // Keys go to members only. Hosts sync ciphertext and must never be able to read it.
+        for (epoch, key) in s.keys().iter().filter(|_| s.is_member(&peer)) {
             if !epochs.contains(epoch) {
                 self.send_to(&peer, Frame::Key { server, epoch: *epoch, key: *key });
             }
@@ -414,13 +457,14 @@ impl Engine {
     /// Validates, persists, announces, and forwards events. `from` is excluded from forwarding.
     fn ingest(&mut self, server: ServerId, events: Vec<Event>, from: Option<PeerId>) -> Result<()> {
         let s = self.servers.get_mut(&server).expect("caller checked");
-        let was_member = s.is_member(&self.secret.public());
+        let me = self.secret.public();
+        let was_in = s.is_member(&me) || s.is_host(&me);
         let out = s.ingest(events);
         self.store.put_events(&out.accepted)?;
 
         if !out.accepted.is_empty() {
             let s = &self.servers[&server];
-            for member in s.members() {
+            for member in s.sync_peers() {
                 if Some(member) != from && member != self.me() {
                     for chunk in out.accepted.chunks(BATCH) {
                         self.send_to(&member, Frame::Events(chunk.to_vec()));
@@ -428,8 +472,8 @@ impl Engine {
                 }
             }
         }
-        let now_member = self.servers[&server].is_member(&self.me());
-        if now_member && !was_member {
+        let s = &self.servers[&server];
+        if (s.is_member(&me) || s.is_host(&me)) && !was_in {
             // We just learned we're in: catch up with everyone else in it.
             self.reconnect();
         }
@@ -444,7 +488,7 @@ impl Engine {
             }
         }
         for change in changes {
-            if let Change::MemberAdded(peer) = &change {
+            if let Change::MemberAdded(peer) | Change::HostAdded(peer) = &change {
                 self.dial(*peer);
             }
             self.emit(Update::Server { server, change });
@@ -468,7 +512,8 @@ impl Engine {
     fn join(&mut self, server: ServerId, via: PeerId) -> Result<()> {
         if !self.servers.contains_key(&server) {
             self.store.add_server(server)?;
-            self.servers.insert(server, ServerState::new(server));
+            let state = self.new_state(server);
+            self.servers.insert(server, state);
         }
         if self.peers.contains_key(&via) {
             self.send_have(&via, server);
@@ -498,6 +543,25 @@ impl Engine {
         if !self.server(server)?.is_member(&peer) {
             self.author_admin(server, AdminOp::Add { peer })?;
         }
+        self.deliver_invite(server, peer)
+    }
+
+    /// Hosting is invite-shaped too: the node joins through whoever asked it.
+    fn add_host(&mut self, server: ServerId, peer: PeerId) -> Result<()> {
+        if !self.server(server)?.is_host(&peer) {
+            self.author_admin(server, AdminOp::AddHost { peer })?;
+        }
+        self.deliver_invite(server, peer)
+    }
+
+    fn remove_host(&mut self, server: ServerId, peer: PeerId) -> Result<()> {
+        if !self.server(server)?.is_host(&peer) {
+            bail!("not a host of this server");
+        }
+        self.author_admin(server, AdminOp::RemoveHost { peer })
+    }
+
+    fn deliver_invite(&mut self, server: ServerId, peer: PeerId) -> Result<()> {
         let name = self.server(server)?.name.clone().unwrap_or_default();
         if self.peers.contains_key(&peer) {
             self.send_to(&peer, Frame::Invite { server, name });
@@ -582,6 +646,7 @@ impl Engine {
                 name: s.name.clone(),
                 owner: s.owner(),
                 members: s.members(),
+                hosts: s.hosts().to_vec(),
                 channels: s.channels.values().cloned().collect(),
                 epoch: s.epoch(),
             })
