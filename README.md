@@ -24,6 +24,11 @@ that never leaves your device.
 - **Profiles**: display name and profile picture, shared with your contacts.
 - **Encryption**: messages are sealed (XChaCha20-Poly1305) under a server key
   only members hold. Removing someone rotates the key.
+- **Calls**: a Discord-style call screen with a tile per person, green
+  speaking borders, everyone's mute and deafen state, click-to-focus, and a
+  control bar. DM calls sit above the conversation.
+- **Cameras**: up to 720p30, seen by everyone in the call. You see your own
+  camera and your own screen share.
 - **Voice**: Opus at 64 kbps with forward error correction over QUIC datagrams,
   with a jitter buffer and loss concealment. Mute and deafen. Speaking rings
   show for everyone in the server, not just people in the call. If there's no
@@ -51,6 +56,14 @@ cd crates/hearth-desktop && cargo tauri dev
 
 Set `HEARTH_DATA_DIR` (app) or `--data-dir` (CLI) to run several identities on
 one machine.
+
+### Android
+
+Install `Hearth_<version>_android-arm64.apk` from the latest release (allow
+installing from your browser when Android asks). The app checks GitHub for
+new versions and downloads the next APK; Android only installs it if it is
+signed with the same key. Calls, cameras, files, and notifications work;
+sharing your screen from a phone isn't supported yet (you can watch others').
 
 ### Windows
 
@@ -135,8 +148,11 @@ relays, storage nodes and network observers. Be aware of these limits:
   a storage node is online.
 - **DM offline delivery** needs one of you to be online, or a storage node.
   Friend requests and invites queue until the other person comes online.
-- **Screen share** requires WebCodecs. It works in the Windows app (WebView2),
-  but Linux WebKitGTK may not support it yet.
+- **Screen share and cameras** need WebCodecs. They work in the Windows app
+  (WebView2) and on Android (watching only, for screen shares). Linux
+  WebKitGTK may not support them yet.
+- **Android** keeps calls running only while the app is open; there's no
+  background call service yet.
 - **Mesh voice.** Every participant sends audio to every other participant,
   which works well for small groups. Routing large rooms through a node is
   planned.

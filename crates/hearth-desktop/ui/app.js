@@ -1678,22 +1678,41 @@ setInterval(() => {
 // ---------- video: camera & screen share ----------
 //
 // Frame payload (sent to Rust, then encrypted per recipient):
-//   flags u8 (bit 0 = keyframe) | codec u8 (1 = H.264) | width u16 | height u16 | timestamp µs u64 | data
+//   flags u8 (bit 0 = keyframe) | codec u8 (1 = H.264, 2 = VP8) | width u16 | height u16 | timestamp µs u64 | data
 // Incoming frames arrive as: kind u8 (2 = screen, 3 = camera) | peer id (32) | payload.
 
-const SCREEN = { kind: 2, codec: "avc1.640033", bitrate: 6_000_000, framerate: 60, keyEvery: 240, push: "push_video" }; // High@5.1: 1440p60
-const CAMERA = { kind: 3, codec: "avc1.42E01F", bitrate: 900_000, framerate: 30, keyEvery: 60, push: "push_camera" }; // Baseline: 720p30
+const SCREEN = { kind: 2, h264: "avc1.640033", bitrate: 6_000_000, framerate: 60, keyEvery: 240, push: "push_video" }; // High@5.1: 1440p60
+const CAMERA = { kind: 3, h264: "avc1.42E01F", bitrate: 900_000, framerate: 30, keyEvery: 60, push: "push_camera" }; // Baseline: 720p30
 const HEADER = 14;
+const H264 = 1;
+const VP8 = 2;
+
+/** H.264 where this device can encode it, else VP8 (every WebCodecs build has it). */
+async function pickCodec(cfg, width, height) {
+  const base = { width, height, bitrate: cfg.bitrate, framerate: cfg.framerate };
+  try {
+    if ((await VideoEncoder.isConfigSupported({ ...base, codec: cfg.h264, avc: { format: "annexb" } })).supported) return { id: H264, codec: cfg.h264 };
+  } catch {
+    /* fall through to VP8 */
+  }
+  return { id: VP8, codec: "vp8" };
+}
+
+/** Decoder codec string for a frame's codec byte. */
+function decoderCodec(id, kind) {
+  return id === VP8 ? "vp8" : kind === 2 ? SCREEN.h264 : CAMERA.h264;
+}
 
 function canEncode() {
   return !!(window.VideoEncoder && window.VideoFrame);
 }
 
 /** Encodes `track` with WebCodecs and pushes frames to Rust. Returns controls. */
-function startEncoder(track, cfg) {
+async function startEncoder(track, cfg) {
   const settings = track.getSettings();
   const width = (settings.width || 1280) & ~1;
   const height = (settings.height || 720) & ~1;
+  const chosen = await pickCodec(cfg, width, height);
   let forceKey = true;
   let frames = 0;
   let stopped = false;
@@ -1702,7 +1721,7 @@ function startEncoder(track, cfg) {
       const buf = new Uint8Array(HEADER + chunk.byteLength);
       const view = new DataView(buf.buffer);
       buf[0] = chunk.type === "key" ? 1 : 0;
-      buf[1] = 1;
+      buf[1] = chosen.id;
       view.setUint16(2, width);
       view.setUint16(4, height);
       view.setBigUint64(6, BigInt(Math.max(0, Math.round(chunk.timestamp))));
@@ -1712,7 +1731,7 @@ function startEncoder(track, cfg) {
     error: (e) => toast(`Video encoder error: ${e.message}`, { error: true }),
   });
   encoder.configure({
-    codec: cfg.codec,
+    codec: chosen.codec,
     width,
     height,
     bitrate: cfg.bitrate,
@@ -1720,7 +1739,7 @@ function startEncoder(track, cfg) {
     latencyMode: "realtime",
     // Not "prefer-hardware": Chromium then fails outright on machines without a
     // hardware encoder instead of falling back. The default still uses hardware when present.
-    avc: { format: "annexb" },
+    ...(chosen.id === H264 ? { avc: { format: "annexb" } } : {}),
   });
   const encode = (frame) => {
     // Drop frames rather than queue them when the encoder falls behind.
@@ -1792,7 +1811,7 @@ async function startShare() {
     return; // picker cancelled
   }
   const track = stream.getVideoTracks()[0];
-  const enc = startEncoder(track, SCREEN);
+  const enc = await startEncoder(track, SCREEN);
   track.onended = () => stopShare();
   state.sharing = { ...enc, preview: previewVideo(stream, false) };
   await call("set_live", { live: true });
@@ -1823,7 +1842,7 @@ async function startCamera() {
     return;
   }
   const track = stream.getVideoTracks()[0];
-  const enc = startEncoder(track, CAMERA);
+  const enc = await startEncoder(track, CAMERA);
   track.onended = () => stopCamera();
   state.camera = { ...enc, preview: previewVideo(stream, true) };
   await call("set_camera", { on: true });
@@ -1846,11 +1865,15 @@ function hex(bytes) {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-function makeViewer(id, codec) {
+function makeViewer(id) {
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-  const v = { canvas, waitingForKey: true, frames: 0, decoder: null };
-  const configure = () => {
+  const kind = +id.split("|")[0];
+  const v = { canvas, waitingForKey: true, frames: 0, decoder: null, codecId: 0 };
+  // (Re)creates the decoder for whatever codec the sender is using.
+  v.configure = (codecId) => {
+    if (v.decoder && v.decoder.state !== "closed") v.decoder.close();
+    v.codecId = codecId;
     v.decoder = new VideoDecoder({
       output: (frame) => {
         if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
@@ -1862,12 +1885,11 @@ function makeViewer(id, codec) {
       error: () => {
         // Start over from the next keyframe.
         v.waitingForKey = true;
-        configure();
+        v.codecId = 0;
       },
     });
-    v.decoder.configure({ codec, optimizeForLatency: true });
+    v.decoder.configure({ codec: decoderCodec(codecId, kind), optimizeForLatency: true });
   };
-  configure();
   viewers.set(id, v);
   return v;
 }
@@ -1887,12 +1909,13 @@ function onVideo(buf) {
   let v = viewers.get(id);
   if (!v) {
     if (kind !== 3) return; // screen shares only decode while you're watching
-    v = makeViewer(id, CAMERA.codec);
+    v = makeViewer(id);
   }
   const frame = data.subarray(33);
   const view = new DataView(frame.buffer, frame.byteOffset);
   const keyFrame = (frame[0] & 1) === 1;
   if (v.waitingForKey && !keyFrame) return;
+  if (keyFrame && frame[1] !== v.codecId) v.configure(frame[1]);
   v.waitingForKey = false;
   try {
     v.decoder.decode(new EncodedVideoChunk({ type: keyFrame ? "key" : "delta", timestamp: Number(view.getBigUint64(6)), data: frame.subarray(HEADER) }));
@@ -1906,7 +1929,7 @@ function startWatching(peer) {
     toast("Watching streams isn't supported by this device's webview yet.", { error: true });
     return;
   }
-  makeViewer(`2|${peer}`, SCREEN.codec);
+  makeViewer(`2|${peer}`);
   state.watching.add(peer);
   state.focus = `2|${peer}`;
   invoke("watch", { peer, on: true }).catch((e) => toast(String(e), { error: true }));

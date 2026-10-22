@@ -453,6 +453,25 @@ async function run() {
     await until("bob's camera decoded", () => q(`.tile[data-peer="${BOB}"] canvas`)?.width > 0, 8000);
   });
 
+  await test("camera falls back to VP8 where H.264 can't encode", async () => {
+    q('[data-ctl="camera"]').click();
+    await until("camera off", () => called("set_camera").some((c) => !c.args.on));
+    const orig = VideoEncoder.isConfigSupported.bind(VideoEncoder);
+    VideoEncoder.isConfigSupported = async (c) => (c.codec.startsWith("avc1") ? { supported: false } : orig(c));
+    try {
+      const before = called("push_camera").length;
+      q('[data-ctl="camera"]').click();
+      await until("VP8 keyframe out", () => called("push_camera").slice(before).some((c) => c.args[0] & 1 && c.args[1] === 2), 6000);
+      // The loopback receiver switches its decoder from H.264 to VP8 and keeps drawing.
+      const canvas = q(`.tile[data-peer="${BOB}"] canvas`);
+      const pixel = () => Array.from(canvas.getContext("2d").getImageData(10, 10, 1, 1).data).join();
+      const first = pixel();
+      await until("bob's VP8 video updates", () => pixel() !== first, 6000);
+    } finally {
+      VideoEncoder.isConfigSupported = orig;
+    }
+  });
+
   await test("focus a tile", async () => {
     q(`.tile[data-peer="${BOB}"]`).click();
     await until("spotlight", () => q(".tiles.spotlight .tile.big")?.dataset.peer === BOB);

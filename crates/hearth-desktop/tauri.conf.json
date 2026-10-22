@@ -36,6 +36,9 @@
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
       }
+    },
+    "android": {
+      "minSdkVersion": 26
     }
   },
   "plugins": {
