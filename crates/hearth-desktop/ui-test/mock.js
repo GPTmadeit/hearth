@@ -270,6 +270,7 @@ function lastMsgRow() {
 }
 
 async function test(name, fn) {
+  document.body.dataset.progress = `running "${name}" (${results.length} done, errors: ${errors.join("; ") || "none"})`;
   try {
     await fn();
     results.push({ name, ok: true });

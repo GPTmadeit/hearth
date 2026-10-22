@@ -67,11 +67,16 @@ class Chrome:
     on other threads (like video encoding), which made encoder tests flaky.
     """
 
-    def __init__(self, binary):
+    def __init__(self, binary, url):
         self.to_chrome_r, self.to_chrome_w = os.pipe()
         self.from_chrome_r, self.from_chrome_w = os.pipe()
         self.proc = subprocess.Popen(
-            [binary, "--headless=new", "--no-sandbox", "--disable-gpu", "--remote-debugging-pipe", "--no-first-run", "about:blank"],
+            [
+                binary, "--headless=new", "--no-sandbox", "--disable-gpu", "--remote-debugging-pipe", "--no-first-run",
+                # Keep the page "foreground": throttled timers and paused video callbacks stall media tests.
+                "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
+                url,
+            ],
             close_fds=False,  # Python would otherwise close fds 3 and 4 after the dup2 below
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -120,15 +125,26 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=UI))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}/index.html"
-    chrome = Chrome(find_chrome())
+    chrome = Chrome(find_chrome(), url)
+    progress = ""
     try:
-        target = chrome.send("Target.createTarget", {"url": url})["targetId"]
+        target = None
+        for _ in range(100):
+            pages = [t for t in chrome.send("Target.getTargets")["targetInfos"] if t["type"] == "page" and t["url"].startswith(url.rsplit("/", 1)[0])]
+            if pages:
+                target = pages[0]["targetId"]
+                break
+            time.sleep(0.1)
+        if not target:
+            sys.exit("Chrome never opened the test page")
         session = chrome.send("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
+        chrome.send("Emulation.setFocusEmulationEnabled", {"enabled": True}, session)
         deadline = time.time() + 240
         results = None
         while time.time() < deadline:
-            r = chrome.send("Runtime.evaluate", {"expression": "document.body && document.body.dataset.results || ''", "returnByValue": True}, session)
-            value = r.get("result", {}).get("value")
+            expr = "JSON.stringify([document.body && document.body.dataset.results || '', document.body && document.body.dataset.progress || ''])"
+            r = chrome.send("Runtime.evaluate", {"expression": expr, "returnByValue": True}, session)
+            value, progress = json.loads(r.get("result", {}).get("value") or '["", ""]')
             if value:
                 results = json.loads(value)
                 break
@@ -138,7 +154,7 @@ def main():
         server.shutdown()
 
     if results is None:
-        sys.exit("UI tests produced no results within 4 minutes (did the page fail to load?)")
+        sys.exit(f"UI tests produced no results within 4 minutes; last progress: {progress or 'none (page never booted)'}")
     failed = [r for r in results if not r["ok"]]
     for r in results:
         print(("PASS  " if r["ok"] else "FAIL  ") + r["name"] + ("" if r["ok"] else f": {r['error']}"))
