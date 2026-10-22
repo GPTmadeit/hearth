@@ -5,6 +5,7 @@ const results = [];
 const calls = [];
 const errors = [];
 window.addEventListener("error", (e) => errors.push(String(e.message)));
+document.addEventListener("securitypolicyviolation", (e) => errors.push(`CSP blocked ${e.blockedURI} (${e.violatedDirective})`));
 window.addEventListener("unhandledrejection", (e) => errors.push("unhandled rejection: " + String(e.reason)));
 
 const ME = "a".repeat(64);
@@ -46,6 +47,9 @@ function emit(payload) {
   listener?.({ payload });
 }
 
+let statTicks = 0;
+let scans = 0;
+
 const handlers = {
   me: () => ({ id: ME, name: "neo" }),
   names: () => ({ [BOB]: "bob", [CAROL]: "carol" }),
@@ -65,6 +69,20 @@ const handlers = {
     output: "pulseaudio:headset",
   }),
   set_audio_devices: () => [],
+  call_stats: () => {
+    statTicks++;
+    return {
+      input_db: -20, transmitting: true, sent_packets: 50 * statTicks, sent_bytes: 8000 * statTicks,
+      peers: [{ peer: BOB, rtt_ms: 42, relay: false, received: 25 * statTicks, received_bytes: 4000 * statTicks, lost: statTicks, late: 0, jitter_ms: 1.5, buffered_ms: 40, level_db: -30 }],
+    };
+  },
+  my_link: () => `hearth://friend/${ME}`,
+  invite_link: ({ server }) => `hearth://join/${server}/${ME}/${"ab".repeat(16)}`,
+  qr_svg: ({ text }) => `<svg xmlns="http://www.w3.org/2000/svg" data-text="${text}" width="10" height="10"><rect width="10" height="10"/></svg>`,
+  // The camera "sees" a friend code on the third frame.
+  scan_qr: () => (++scans >= 3 ? `hearth://friend/${CAROL}` : null),
+  revoke_invite_links: () => 2,
+  open_link: ({ link }) => (link.includes("/join/") ? "join" : "friend"),
   set_live: () => null,
   watch: () => null,
   // Loop our camera back as Bob's, so the receive path (decode -> tile) is exercised too.
@@ -76,7 +94,7 @@ const handlers = {
     window.__video?.onmessage?.(out.buffer);
     return 1;
   },
-  push_video: () => 1,
+  push_video: () => window.__viewers ?? 1,
   servers: () => structuredClone(db.servers),
   history: ({ channel }) => structuredClone(db.messages[channel] || []),
   create_server: ({ name }) => {
@@ -223,7 +241,7 @@ async function until(what, fn, timeout = 2500) {
     if (fn()) return;
     await sleep(20);
   }
-  throw new Error(`timed out waiting for ${what}`);
+  throw new Error(`timed out waiting for ${what}${errors.length ? ` (errors: ${errors.join("; ")})` : ""}`);
 }
 
 function called(cmd) {
@@ -368,6 +386,15 @@ async function run() {
     await until("img shown", () => q('.att-image img[alt="cat.png"]'));
   });
 
+  await test("incoming video plays inline", async () => {
+    const clip = { name: "clip.webm", mime: "video/webm", blob: { hash: "8".repeat(64), key: "6".repeat(64), size: 100 } };
+    emit({ type: "message", server: DEN, message: msg(BOB, DEN_GENERAL, "", { attachments: [clip] }) });
+    await until("load button", () => q(".att-video .att-load"));
+    q(".att-video .att-load").click();
+    await until("video element", () => q('.att-video video[src^="blob:"]'));
+    await sleep(300); // a CSP block would be reported by now
+  });
+
   await test("links open in the browser", async () => {
     emit({ type: "message", server: DEN, message: msg(BOB, DEN_GENERAL, "see https://example.com/page") });
     await until("link", () => q('a[data-url="https://example.com/page"]'));
@@ -409,6 +436,17 @@ async function run() {
     q('#add-friend-form [name="peer"]').value = CAROL;
     q("#add-friend-form button").click();
     await until("request sent", () => called("add_friend").some((c) => c.args.peer === CAROL));
+  });
+
+  await test("friend QR code shows; scanning one sends a request", async () => {
+    await until("moved to pending", () => q('[data-tab="pending"].active'));
+    q('[data-tab="add"]').click();
+    await until("my code", () => q("[data-qr-me] svg")?.dataset.text === `hearth://friend/${ME}`);
+    q("[data-scan]").click();
+    await until("scanner", () => q(".scanner video"));
+    await until("scanned and used", () => called("open_link").some((c) => c.args.link === `hearth://friend/${CAROL}`), 6000);
+    await until("scanner closed", () => !q(".scanner"));
+    if (!called("scan_qr")[0].args.length || called("scan_qr")[0].args.length < 8) throw new Error("no frame sent to the QR reader");
   });
 
   await test("create server from the rail", async () => {
@@ -500,6 +538,7 @@ async function run() {
     await fillModal({ input: "pulseaudio:usb_mic", camera: "webcam-1" });
     await until("audio switched", () => called("set_audio_devices").some((c) => c.args.input === "pulseaudio:usb_mic" && c.args.output === "pulseaudio:headset"));
     await until("webcam opened", () => cameraRequests.slice(before).some((c) => c.video?.deviceId?.exact === "webcam-1"));
+    await until("saved and closed", () => !q(".modal"), 6000);
     await until("still sending", () => q(`.tile[data-peer="${ME}"] video.mirror`));
     if (called("set_camera").length !== cameraCalls) throw new Error("camera blinked off for others while switching");
     if (JSON.parse(localStorage.getItem("hearth.settings")).camera !== "webcam-1") throw new Error("camera choice not saved");
@@ -509,6 +548,19 @@ async function run() {
     const again = cameraRequests.length;
     q('[data-ctl="camera"]').click();
     await until("reopened chosen", () => cameraRequests.slice(again).some((c) => c.video?.deviceId?.exact === "webcam-1"));
+  });
+
+  await test("live call quality graph", async () => {
+    q('[data-ctl="devices"]').click();
+    await until("stats row", () => q(".stats-table td")?.textContent.includes("bob"), 4000);
+    await until("ping and path", () => q(".stats-table").textContent.includes("42 ms") && q(".stats-table").textContent.includes("direct"), 4000);
+    await until("loss shown", () => /\d\.\d%/.test(q(".stats-table").textContent));
+    await until("mic meter moves", () => parseFloat(q(".meter-fill").style.width) > 0);
+    if (!(q('.stats-graphs canvas[data-metric="rtt"]').width > 0)) throw new Error("graph not drawn");
+    q("[data-cancel]").click();
+    const n = called("call_stats").length;
+    await sleep(1200);
+    if (called("call_stats").length > n + 1) throw new Error("kept polling after the modal closed");
   });
 
   await test("focus a tile", async () => {
@@ -525,6 +577,29 @@ async function run() {
     await until("own screen tile", () => q(`.tile[data-tile="2|${ME}"] video`));
     q('[data-ctl="share"]').click();
     await until("stopped", () => called("set_live").some((c) => !c.args.live));
+  });
+
+  await test("screen share stops encoding while nobody watches", async () => {
+    window.__viewers = 0;
+    try {
+      q('[data-ctl="share"]').click();
+      await until("sharing", () => called("set_live").filter((c) => c.args.live).length >= 2);
+      await until("first frame", () => called("push_video").length > 0, 4000);
+      await sleep(600);
+      const before = called("push_video").length;
+      await sleep(1500);
+      const idleFrames = called("push_video").length - before;
+      if (idleFrames > 2) throw new Error(`encoded ${idleFrames} frames for nobody`);
+      // Someone starts watching: frames flow again at once.
+      window.__viewers = 1;
+      emit({ type: "keyframe_requested", camera: false });
+      const woke = called("push_video").length;
+      await until("frames flowing", () => called("push_video").length > woke + 10, 4000);
+    } finally {
+      window.__viewers = 1;
+      q('[data-ctl="share"]').click();
+      await until("stopped", () => called("set_live").filter((c) => !c.args.live).length >= 2);
+    }
   });
 
   await test("leave the call from the controls", async () => {
@@ -549,8 +624,23 @@ async function run() {
 
   await test("invite a peer", async () => {
     q("#invite-btn").click();
+    await until("invite QR", () => q("#invite-qr svg")?.dataset.text.startsWith("hearth://join/"));
+    await until("invite link", () => q("#invite-link").textContent.includes("hearth://join/"));
     await fillModal({ peer: "e".repeat(64) });
     await until("invite call", () => called("invite").length === 1);
+  });
+
+  await test("joining by code opens the server", async () => {
+    emit({ type: "joined", server: DEN });
+    await until("in the den", () => q("#server-header")?.textContent.includes("The Den"));
+  });
+
+  await test("owner can cancel invite codes", async () => {
+    q("#server-menu").click();
+    await until("menu", () => q("#revoke-codes"));
+    q("#revoke-codes").click();
+    await until("cancelled", () => qa(".toast").some((t) => t.textContent.includes("Cancelled 2 invite codes")));
+    q("[data-cancel]").click();
   });
 
   await test("kick a member", async () => {

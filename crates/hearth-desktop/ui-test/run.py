@@ -16,6 +16,7 @@ import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI = os.path.join(HERE, "..", "ui")
+CSP = json.load(open(os.path.join(HERE, "..", "tauri.conf.json")))["app"]["security"]["csp"]
 
 
 def find_chrome():
@@ -36,6 +37,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if path in ("/", "/index.html"):
             page = open(os.path.join(UI, "index.html"), encoding="utf-8").read()
             page = page.replace('<script src="app.js"', '<script src="/__test/mock.js"></script>\n    <script src="app.js"', 1)
+            # Enforce the app's real content security policy, so a blocked image or video fails here too.
+            page = page.replace("<head>", f'<head>\n    <meta http-equiv="Content-Security-Policy" content="{CSP}">', 1)
             body = page.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")

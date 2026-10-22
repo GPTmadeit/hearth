@@ -74,6 +74,8 @@ commands:
   /voice [channel]         join voice           /leave               leave voice
   /mute  /deafen           toggle mic/sound      /live  /unlive       stream (--video-test)
   /cam  /nocam             camera (--video-test)
+  /link                    invite link + QR     /open <link>         use a link or peer ID
+  /stats                   call quality
   /devices                 list mics/speakers    /mic <n>  /speakers <n>  pick one (0 = default)
   /watch <peer>            watch a stream        /peers               who's online
   /friend <peer>           add/accept friend     /friends             friends & requests
@@ -341,7 +343,10 @@ impl Repl {
         match cmd {
             "/quit" | "/q" => return Ok(true),
             "/help" | "/h" => println!("{HELP}"),
-            "/id" => println!("{}", self.hearth.id()),
+            "/id" => {
+                let link = hearth_core::ShareLink::Friend(self.hearth.id());
+                println!("{}\n{}\nfriend link: {link}", qr_text(&link.to_string()), self.hearth.id());
+            }
             "/servers" => {
                 for (i, s) in self.hearth.servers().await?.iter().enumerate() {
                     let mark = if self.current.is_some_and(|c| c.0 == s.id) { "*" } else { " " };
@@ -401,6 +406,20 @@ impl Repl {
                 let peer = self.resolve_peer(rest).await?;
                 self.hearth.invite(s.id, peer).await?;
                 println!("invited {}", self.who(&peer));
+            }
+            "/link" => {
+                let s = self.current_server().await?;
+                let link = self.hearth.invite_link(s.id, std::time::Duration::from_secs(24 * 3600)).await?;
+                println!("{}", qr_text(&link.to_string()));
+                println!("anyone with this link can join {} for 24 hours:\n{link}", s.name.as_deref().unwrap_or("this server"));
+            }
+            "/open" => {
+                let link: hearth_core::ShareLink = rest.parse()?;
+                self.hearth.open_link(link.clone()).await?;
+                match link {
+                    hearth_core::ShareLink::Friend(p) => println!("friend request sent to {}", self.who(&p)),
+                    hearth_core::ShareLink::Join { .. } => println!("asked to join; waiting for the owner's device"),
+                }
             }
             "/kick" => {
                 let s = self.current_server().await?;
@@ -507,6 +526,23 @@ impl Repl {
                 self.audio = None;
                 self.hearth.voice_leave().await?;
                 println!("left voice");
+            }
+            "/stats" => {
+                let st = self.audio.as_ref().context("not in voice")?.stats();
+                println!("sent {} packets ({} KB), mic {:.0} dB", st.sent_packets, st.sent_bytes / 1000, st.input_db);
+                for p in st.peers {
+                    let rtt = p.rtt.map_or("?".into(), |d| format!("{} ms", d.as_millis()));
+                    let path = if p.relay { "relay" } else { "direct" };
+                    println!(
+                        "  {}: ping {rtt} ({path}), got {} lost {} late {}, jitter {:.1} ms, buffer {} ms",
+                        self.who(&p.peer),
+                        p.received,
+                        p.lost,
+                        p.late,
+                        p.jitter.as_secs_f64() * 1000.0,
+                        p.buffered.as_millis()
+                    );
+                }
             }
             "/devices" => {
                 let (inputs, outputs) = hearth_media::list_devices()?;
@@ -686,6 +722,7 @@ impl Repl {
                     self.names.insert(peer, n.1);
                 }
             }
+            Update::Joined { server } => println!("* invite code accepted; syncing server {}", server.short()),
             Update::ServerRemoved { server } => {
                 if self.current.is_some_and(|c| c.0 == server) {
                     self.current = None;
@@ -778,5 +815,14 @@ impl Repl {
             Change::HostAdded(p) => println!("* {sname} is now stored on node {}", p.fmt_short()),
             Change::HostRemoved(p) => println!("* node {} no longer stores {sname}", p.fmt_short()),
         }
+    }
+}
+
+/// A QR code drawn with half-block characters, two rows per line.
+fn qr_text(data: &str) -> String {
+    use qrcode::render::unicode::Dense1x2;
+    match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(code) => code.render::<Dense1x2>().dark_color(Dense1x2::Light).light_color(Dense1x2::Dark).build(),
+        Err(_) => String::new(),
     }
 }

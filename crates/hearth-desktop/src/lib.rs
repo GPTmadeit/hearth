@@ -183,6 +183,7 @@ enum UpdateDto {
     ServerChanged { server: String },
     Removed { server: String },
     ServerRemoved { server: String },
+    Joined { server: String },
     Voice {
         server: String,
         channel: String,
@@ -222,6 +223,7 @@ fn to_dto(u: Update, me: PeerId) -> UpdateDto {
         }
         Update::Server { server, .. } => UpdateDto::ServerChanged { server: server.to_string() },
         Update::ServerRemoved { server } => UpdateDto::ServerRemoved { server: server.to_string() },
+        Update::Joined { server } => UpdateDto::Joined { server: server.to_string() },
         Update::Voice { server, channel, peers, live, camera, muted, deafened } => UpdateDto::Voice {
             server: server.to_string(),
             channel: eid(&channel),
@@ -440,6 +442,68 @@ async fn friends(app: State<'_, App>) -> Res<Vec<FriendDto>> {
         .collect())
 }
 
+// ---- links & QR codes ----
+
+/// Your friend link, for showing as a QR code.
+#[tauri::command]
+fn my_link(app: State<'_, App>) -> String {
+    hearth_core::ShareLink::Friend(app.hearth.id()).to_string()
+}
+
+/// A link that lets anyone who has it join `server` for `hours`.
+#[tauri::command]
+async fn invite_link(app: State<'_, App>, server: String, hours: u64) -> Res<String> {
+    let valid = std::time::Duration::from_secs(hours.clamp(1, 24 * 30) * 3600);
+    Ok(app.hearth.invite_link(parse_sid(&server)?, valid).await.map_err(err)?.to_string())
+}
+
+#[tauri::command]
+async fn revoke_invite_links(app: State<'_, App>, server: String) -> Res<usize> {
+    app.hearth.revoke_invite_links(parse_sid(&server)?).await.map_err(err)
+}
+
+/// Uses a scanned or pasted link (or bare peer ID). Returns what it was: "friend" or "join".
+#[tauri::command]
+async fn open_link(app: State<'_, App>, link: String) -> Res<&'static str> {
+    let link: hearth_core::ShareLink = link.parse().map_err(|_| "that isn't a Hearth code or link".to_string())?;
+    let kind = match link {
+        hearth_core::ShareLink::Friend(_) => "friend",
+        hearth_core::ShareLink::Join { .. } => "join",
+    };
+    app.hearth.open_link(link).await.map_err(err)?;
+    Ok(kind)
+}
+
+/// `text` as a QR code in SVG.
+#[tauri::command]
+fn qr_svg(text: String) -> Res<String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(err)?;
+    Ok(code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(240, 240)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build())
+}
+
+/// Looks for a QR code in a greyscale camera frame: `width (u32 LE) | height (u32 LE) | pixels`.
+#[tauri::command]
+async fn scan_qr(request: Request<'_>) -> Res<Option<String>> {
+    let InvokeBody::Raw(frame) = request.body() else {
+        return Err("expected raw bytes".into());
+    };
+    let frame = frame.clone();
+    tauri::async_runtime::spawn_blocking(move || find_qr(&frame)).await.map_err(err)
+}
+
+fn find_qr(frame: &[u8]) -> Option<String> {
+    let w = u32::from_le_bytes(frame.get(..4)?.try_into().ok()?) as usize;
+    let h = u32::from_le_bytes(frame.get(4..8)?.try_into().ok()?) as usize;
+    let px = frame.get(8..8 + w.checked_mul(h)?)?;
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| px[y * w + x]);
+    img.detect_grids().into_iter().find_map(|g| g.decode().ok().map(|(_, text)| text))
+}
+
 #[tauri::command]
 async fn add_friend(app: State<'_, App>, peer: String) -> Res<()> {
     app.hearth.add_friend(parse_peer(&peer)?).await.map_err(err)
@@ -651,6 +715,58 @@ async fn set_audio_devices(app: State<'_, App>, input: Option<String>, output: O
         Some(a) => a.set_devices(Devices { input, output }).map_err(|e| format!("couldn't switch: {e:#}")),
         None => Ok(Vec::new()),
     }
+}
+
+#[derive(Serialize)]
+struct PeerStatsDto {
+    peer: String,
+    rtt_ms: Option<f64>,
+    relay: bool,
+    received: u64,
+    received_bytes: u64,
+    lost: u64,
+    late: u64,
+    jitter_ms: f64,
+    buffered_ms: f64,
+    level_db: f32,
+}
+
+#[derive(Serialize)]
+struct CallStatsDto {
+    input_db: f32,
+    transmitting: bool,
+    sent_packets: u64,
+    sent_bytes: u64,
+    peers: Vec<PeerStatsDto>,
+}
+
+/// Live call quality, or nothing when not in a call. Counters are totals.
+#[tauri::command]
+fn call_stats(app: State<'_, App>) -> Option<CallStatsDto> {
+    let s = app.audio.lock().unwrap().as_ref()?.stats();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    Some(CallStatsDto {
+        input_db: s.input_db,
+        transmitting: s.transmitting,
+        sent_packets: s.sent_packets,
+        sent_bytes: s.sent_bytes,
+        peers: s
+            .peers
+            .into_iter()
+            .map(|p| PeerStatsDto {
+                peer: p.peer.to_string(),
+                rtt_ms: p.rtt.map(ms),
+                relay: p.relay,
+                received: p.received,
+                received_bytes: p.received_bytes,
+                lost: p.lost,
+                late: p.late,
+                jitter_ms: ms(p.jitter),
+                buffered_ms: ms(p.buffered),
+                level_db: p.level_db,
+            })
+            .collect(),
+    })
 }
 
 /// Mutes/deafens our audio and shows it to everyone in the call.
@@ -875,6 +991,13 @@ pub fn run() {
             set_name,
             audio_devices,
             set_audio_devices,
+            call_stats,
+            my_link,
+            invite_link,
+            revoke_invite_links,
+            open_link,
+            qr_svg,
+            scan_qr,
             servers,
             names,
             online,

@@ -201,7 +201,11 @@ function modal({ title, body = "", fields = [], submit = "OK", onSubmit, extra =
       </form>
     </div>`;
   const form = $("form", root);
-  const close = () => (root.innerHTML = "");
+  const backdrop = root.firstElementChild;
+  // Only ever close this modal: a slow submit mustn't close one opened since.
+  const close = () => {
+    if (root.firstElementChild === backdrop) root.innerHTML = "";
+  };
   $("[data-cancel]", root).onclick = close;
   // A block body on purpose: an onclick property that returns false cancels the
   // default action, which would stop the form's submit button from submitting.
@@ -447,6 +451,13 @@ async function onUpdate(u) {
       break;
     case "server_removed":
       await refreshServers();
+      break;
+    case "joined":
+      // Our invite code was accepted: show the server while it syncs in.
+      await refreshServers();
+      toast("You're in! Syncing the server…");
+      state.view = u.server;
+      render();
       break;
     case "removed":
       toast(`You were removed from ${server(u.server)?.name || "a server"}`, { error: true });
@@ -852,14 +863,17 @@ function renderFriendsPage(main) {
     <div class="friends-page">
       ${
         state.friendsTab === "add"
-          ? `<h3>Add a friend</h3><p class="hint">Paste their peer ID. They'll get your request as soon as they're online.</p>
-             <form id="add-friend-form" class="add-friend"><input name="peer" placeholder="Peer ID (64 characters)" autocomplete="off"><button class="btn primary">Send request</button></form>
-             <h3>Your ID</h3><p class="hint">Share this so friends can add you.</p>${idBox(state.me.id)}`
+          ? `<h3>Add a friend</h3><p class="hint">Scan their QR code, or paste their peer ID or link. They'll get your request as soon as they're online.</p>
+             <form id="add-friend-form" class="add-friend"><input name="peer" placeholder="Peer ID or hearth:// link" autocomplete="off"><button class="btn primary">Send request</button><button type="button" class="btn" data-scan>📷 Scan QR</button></form>
+             <h3>Your code</h3><p class="hint">Friends can scan this to add you, or copy your ID.</p><div class="qr-box" data-qr-me></div>${idBox(state.me.id)}`
           : rows || `<div class="empty"><p>${empty}</p></div>`
       }
     </div>`;
   main.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => ((state.friendsTab = b.dataset.tab), renderMain())));
   main.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => copy(b.dataset.copy)));
+  main.querySelector("[data-scan]")?.addEventListener("click", scanModal);
+  const qrMe = main.querySelector("[data-qr-me]");
+  if (qrMe) showQr(qrMe, invoke("my_link"));
   const form = $("#add-friend-form");
   if (form) {
     form.onsubmit = async (e) => {
@@ -867,6 +881,11 @@ function renderFriendsPage(main) {
       const peer = form.elements.peer.value.trim();
       if (!peer) return;
       try {
+        if (peer.startsWith("hearth://")) {
+          await useLink(peer);
+          form.reset();
+          return;
+        }
         await call("add_friend", { peer });
         form.reset();
         toast("Friend request sent");
@@ -1325,13 +1344,14 @@ function renderTyping() {
   const names = Object.entries(t)
     .filter(([p, until]) => until > now && p !== state.me.id)
     .map(([p]) => who(p));
-  el.textContent = !names.length
+  const text = !names.length
     ? ""
     : names.length === 1
       ? `${names[0]} is typing…`
       : names.length <= 3
         ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)} are typing…`
         : "Several people are typing…";
+  if (el.textContent !== text) el.textContent = text; // runs every second; don't touch the DOM for nothing
 }
 setInterval(renderTyping, 1000);
 
@@ -1449,9 +1469,10 @@ function renderSide() {
 // ---------- modals ----------
 
 function createServerModal() {
-  modal({
+  const root = modal({
     title: "Create a server",
     body: "Your server lives on members' devices (and any storage nodes you add), never on a company's servers.",
+    extra: `<button type="button" class="btn wide" id="join-code">📷 Join with a QR code or link instead</button>`,
     fields: [{ name: "name", label: "Server name", placeholder: `${state.me.name}'s server` }],
     submit: "Create",
     onSubmit: async ({ name }) => {
@@ -1460,6 +1481,109 @@ function createServerModal() {
       await openServer(id);
     },
   });
+  $("#join-code", root).onclick = scanModal;
+}
+
+// ---------- QR codes & links ----------
+
+/** Renders a QR code for the link `text` (a promise) into `el`, with the link to copy. */
+async function showQr(el, text) {
+  try {
+    const link = await text;
+    el.innerHTML = `<div class="qr">${await invoke("qr_svg", { text: link })}</div>`;
+    el.dataset.link = link;
+  } catch (e) {
+    el.textContent = `Couldn't make a QR code: ${e}`;
+  }
+}
+
+/** Acts on a scanned or pasted link: friend request or server join. */
+async function useLink(link) {
+  const kind = await call("open_link", { link });
+  if (kind === "friend") {
+    toast("Friend request sent");
+    await refreshFriends();
+  } else {
+    toast("Asked to join. You'll be let in as soon as the owner's device is online.", { timeout: 8000 });
+  }
+  return kind;
+}
+
+/** Scans a QR code with the camera (or takes a pasted link). */
+function scanModal() {
+  const root = modal({
+    title: "Scan a QR code",
+    body: "Point your camera at someone's friend code or a server invite code.",
+    extra: `<div class="scanner"><video playsinline muted></video><div class="scan-frame"></div><p class="scan-status hint">Starting camera…</p></div>`,
+    fields: [{ name: "link", label: "Or paste a link", placeholder: "hearth://… or a peer ID" }],
+    submit: "Use link",
+    onSubmit: async ({ link }) => {
+      if (!link) throw new Error("Paste a link, or scan a code");
+      await useLink(link);
+    },
+  });
+  const video = $(".scanner video", root);
+  const status = $(".scan-status", root);
+  const canvas = document.createElement("canvas");
+  let stream = null;
+  let busy = false;
+  let done = false;
+  const stop = () => {
+    clearInterval(timer);
+    stream?.getTracks().forEach((t) => t.stop());
+  };
+  const timer = setInterval(async () => {
+    if (!root.contains(video) || !video.isConnected) return stop();
+    if (busy || done || !video.videoWidth) return;
+    busy = true;
+    try {
+      const text = await invoke("scan_qr", grayFrame(video, canvas));
+      if (text && !done) {
+        done = true;
+        status.textContent = "Found a code…";
+        try {
+          await useLink(text);
+          root.innerHTML = "";
+        } catch (e) {
+          done = false;
+          status.textContent = String(e?.message || e);
+        }
+      }
+    } catch {
+      /* try the next frame */
+    } finally {
+      busy = false;
+    }
+  }, 250);
+  (async () => {
+    try {
+      stream = await openCamera();
+      if (!video.isConnected) return stop();
+      video.srcObject = stream;
+      await video.play();
+      status.textContent = "Looking for a code…";
+    } catch (e) {
+      status.textContent = `No camera available (${e.message || e.name}). You can paste a link instead.`;
+    }
+  })();
+}
+
+/** The middle of a video frame as `width | height | greyscale pixels`, for the QR reader. */
+function grayFrame(video, canvas) {
+  const scale = Math.min(1, 640 / video.videoWidth);
+  const w = Math.round(video.videoWidth * scale);
+  const h = Math.round(video.videoHeight * scale);
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, w, h);
+  const rgba = ctx.getImageData(0, 0, w, h).data;
+  const out = new Uint8Array(8 + w * h);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, w, true);
+  dv.setUint32(4, h, true);
+  for (let i = 0, j = 8; i < rgba.length; i += 4, j++) out[j] = (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+  return out;
 }
 
 function createChannelModal(voice) {
@@ -1482,10 +1606,13 @@ function inviteModal() {
   const extra = friends.length
     ? `<label>Invite a friend</label><div class="invite-friends">${friends.map((f) => `<button type="button" class="invite-friend" data-peer="${f.peer}">${avatar(f.peer, "sm")}<span>${esc(who(f.peer))}</span></button>`).join("")}</div>`
     : "";
+  const qr = isOwner(s)
+    ? `<label>Invite code</label><p>Anyone who scans this (or opens the link) within 24 hours can join.</p><div class="qr-box" id="invite-qr"><p class="hint">Making a code…</p></div><div id="invite-link"></div>`
+    : "";
   const root = modal({
     title: `Invite to ${s?.name}`,
     body: "Invite a friend, or paste anyone's peer ID. They'll get the invite as soon as you're both online.",
-    extra,
+    extra: qr + extra,
     fields: [{ name: "peer", label: "Peer ID", placeholder: "64 characters" }],
     submit: "Invite",
     onSubmit: async ({ peer }) => {
@@ -1494,6 +1621,11 @@ function inviteModal() {
       toast("Invite sent");
     },
   });
+  if (isOwner(s)) {
+    const link = invoke("invite_link", { server: s.id, hours: 24 });
+    showQr($("#invite-qr", root), link);
+    link.then((l) => ($("#invite-link", root).innerHTML = idBox(l))).then(() => $$("#invite-link [data-copy]", root).forEach((b) => (b.onclick = () => copy(b.dataset.copy)))).catch(() => {});
+  }
   root.querySelectorAll(".invite-friend").forEach(
     (b) =>
       (b.onclick = async () => {
@@ -1524,7 +1656,7 @@ function serverMenu() {
   if (isOwner(s)) fields.push({ name: "node", label: "Add a storage node (optional)", placeholder: "Node peer ID: keeps encrypted history for offline delivery" });
   const root = modal({
     title: s.name || "Server",
-    extra: `<label>Server ID</label>${idBox(s.id)}<label>Key epoch</label><div class="copybox"><span>${s.epoch}: rotates whenever someone leaves or is removed</span></div>${isOwner(s) ? "" : `<button type="button" class="btn danger wide" id="leave-server">Leave server</button>`}`,
+    extra: `<label>Server ID</label>${idBox(s.id)}<label>Key epoch</label><div class="copybox"><span>${s.epoch}: rotates whenever someone leaves or is removed</span></div>${isOwner(s) ? `<button type="button" class="btn wide" id="revoke-codes">Cancel all invite codes</button>` : `<button type="button" class="btn danger wide" id="leave-server">Leave server</button>`}`,
     fields,
     submit: "Save",
     onSubmit: async ({ notify: n, node }) => {
@@ -1535,6 +1667,10 @@ function serverMenu() {
         toast("Asked the node to host this server");
       }
     },
+  });
+  root.querySelector("#revoke-codes")?.addEventListener("click", async () => {
+    const n = await call("revoke_invite_links", { server: s.id });
+    toast(n ? `Cancelled ${n} invite code${n === 1 ? "" : "s"}. Old QR codes no longer work.` : "There were no active invite codes.");
   });
   root.querySelector("#leave-server")?.addEventListener("click", () =>
     modal({
@@ -1579,7 +1715,7 @@ function settingsModal() {
         ${state.avatars[state.me.id] ? `<button type="button" class="btn" id="avatar-clear">Remove</button>` : ""}
         <input type="file" id="avatar-file" accept="image/*" hidden></div>
       </div>
-      <label>Your peer ID</label>${idBox(state.me.id)}<p style="margin-top:8px">Share this so people can add you. Your private key never leaves this device.</p>
+      <label>Your peer ID</label><div class="qr-box small" id="my-qr"></div>${idBox(state.me.id)}<p style="margin-top:8px">Friends can scan this code or use your ID to add you. Your private key never leaves this device.</p>
       <button type="button" class="btn" id="devices-btn">🎙 Microphone, speakers & camera…</button>`,
     fields: [
       { name: "name", label: "Display name", value: state.me.name },
@@ -1599,6 +1735,7 @@ function settingsModal() {
     },
   });
   $("#devices-btn", root).onclick = devicesModal;
+  showQr($("#my-qr", root), invoke("my_link"));
   $("#avatar-pick", root).onclick = () => $("#avatar-file", root).click();
   $("#avatar-file", root).onchange = async (e) => {
     const f = e.target.files[0];
@@ -1642,7 +1779,7 @@ async function devicesModal() {
   // A saved device that's unplugged still shows, so saving doesn't silently forget it.
   const keep = (list, id, what) => (id && !list.some((d) => d.id === id) ? [...list, { id, name: `${what} (not connected)` }] : list);
   const camId = state.settings.camera || "";
-  modal({
+  const root = modal({
     title: "Voice & video",
     fields: [
       { name: "input", type: "select", label: "Microphone", value: audio.input || "", options: opts(keep(audio.inputs, audio.input, "Microphone"), "Microphone") },
@@ -1661,6 +1798,111 @@ async function devicesModal() {
         await switchCamera();
       }
     },
+  });
+  $(".modal", root).classList.add("wide");
+  callStatsPanel(root);
+}
+
+const STAT_COLORS = ["#57f287", "#5865f2", "#fee75c", "#eb459e", "#3ba55d", "#ed4245", "#9b84ee", "#f97316"];
+
+/** Live call quality: your mic level, and per person ping, loss and more, graphed over the last minute. */
+function callStatsPanel(root) {
+  const box = document.createElement("div");
+  box.className = "call-stats";
+  box.innerHTML = `
+    <h3>Call quality</h3>
+    <div class="mic-meter" title="Your microphone level"><span>Mic</span><div class="meter"><div class="meter-fill"></div></div></div>
+    <div class="stats-graphs">
+      <figure><figcaption>Ping (ms)</figcaption><canvas data-metric="rtt"></canvas></figure>
+      <figure><figcaption>Packet loss (%)</figcaption><canvas data-metric="loss"></canvas></figure>
+    </div>
+    <div class="stats-table"><p class="hint">Join a call to see live quality.</p></div>`;
+  const form = $("form", root);
+  form.insertBefore(box, $(".actions", form));
+  const SAMPLES = 120; // 60 s at 2 per second
+  const history = new Map(); // peer -> [{ rtt, loss }]
+  let prev = null;
+  const tick = async () => {
+    if (!box.isConnected) return clearInterval(timer);
+    const s = await invoke("call_stats").catch(() => null);
+    $(".meter-fill", box).style.width = s ? `${Math.max(0, Math.min(100, ((s.input_db + 60) / 60) * 100))}%` : "0%";
+    $(".meter-fill", box).classList.toggle("on", !!s?.transmitting);
+    if (!s) {
+      prev = null;
+      return;
+    }
+    const now = performance.now();
+    const rows = s.peers.map((p, i) => {
+      const before = prev?.stats.peers.find((x) => x.peer === p.peer);
+      const secs = prev ? (now - prev.at) / 1000 : 0;
+      const got = before ? p.received - before.received : 0;
+      const lost = before ? p.lost - before.lost : 0;
+      const sample = { rtt: p.rtt_ms, loss: got + lost > 0 ? (100 * lost) / (got + lost) : null };
+      const h = history.get(p.peer) || [];
+      h.push(sample);
+      if (h.length > SAMPLES) h.shift();
+      history.set(p.peer, h);
+      const kbps = before && secs ? ((p.received_bytes - before.received_bytes) * 8) / secs / 1000 : 0;
+      const totalLoss = p.received + p.lost ? (100 * p.lost) / (p.received + p.lost) : 0;
+      return `<tr>
+        <td><span class="swatch" style="background:${STAT_COLORS[i % STAT_COLORS.length]}"></span>${esc(who(p.peer))}</td>
+        <td>${p.rtt_ms == null ? "…" : `${Math.round(p.rtt_ms)} ms`}</td>
+        <td class="${p.relay ? "warn" : ""}" title="${p.relay ? "Through a relay server: hole-punching hasn't connected you directly" : "Directly connected"}">${p.relay ? "relay" : "direct"}</td>
+        <td class="${totalLoss > 5 ? "warn" : ""}">${totalLoss.toFixed(1)}%</td>
+        <td>${p.jitter_ms.toFixed(1)} ms</td>
+        <td>${Math.round(p.buffered_ms)} ms</td>
+        <td>${kbps ? Math.round(kbps) : 0} kbps</td>
+      </tr>`;
+    });
+    for (const peer of history.keys()) if (!s.peers.some((p) => p.peer === peer)) history.delete(peer);
+    prev = { at: now, stats: s };
+    $(".stats-table", box).innerHTML = s.peers.length
+      ? `<table><thead><tr><th>Who</th><th>Ping</th><th>Path</th><th>Loss</th><th>Jitter</th><th>Buffer</th><th>In</th></tr></thead><tbody>${rows.join("")}</tbody></table>
+         <p class="hint">You're sending ${s.sent_packets.toLocaleString()} packets so far. Loss and ping are for audio arriving from each person.</p>`
+      : `<p class="hint">Nobody else is in the call yet.</p>`;
+    const order = s.peers.map((p) => p.peer);
+    for (const c of box.querySelectorAll("canvas")) drawSeries(c, order.map((p) => history.get(p) || []), c.dataset.metric, SAMPLES);
+  };
+  const timer = setInterval(tick, 500);
+  tick();
+}
+
+function drawSeries(canvas, series, metric, samples) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 300;
+  const h = canvas.clientHeight || 90;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const values = series.flat().map((x) => x[metric]).filter((v) => v != null);
+  const max = metric === "rtt" ? Math.max(100, ...values) * 1.15 : Math.max(5, ...values) * 1.15;
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.fillStyle = "#949ba4";
+  ctx.font = "10px sans-serif";
+  for (const f of [0.5, 1]) {
+    const y = h - f * (h - 4);
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+    ctx.fillText(String(Math.round(max * f)), 2, y + 11);
+  }
+  series.forEach((pts, i) => {
+    ctx.strokeStyle = STAT_COLORS[i % STAT_COLORS.length];
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let pen = false;
+    pts.forEach((p, j) => {
+      const v = p[metric];
+      if (v == null) return (pen = false);
+      const x = w - ((pts.length - 1 - j) / (samples - 1)) * w;
+      const y = h - (v / max) * (h - 4);
+      if (pen) ctx.lineTo(x, y);
+      else ctx.moveTo(x, y);
+      pen = true;
+    });
+    ctx.stroke();
   });
 }
 
@@ -1768,6 +2010,11 @@ async function startEncoder(track, cfg) {
   let forceKey = true;
   let frames = 0;
   let stopped = false;
+  // Nobody to send to (no watchers, or alone in the call): stop encoding, and
+  // just probe with a keyframe now and then. A new viewer asks for a keyframe
+  // straight away, which wakes us up.
+  let idle = false;
+  let lastProbe = 0;
   const encoder = new VideoEncoder({
     output: (chunk) => {
       const buf = new Uint8Array(HEADER + chunk.byteLength);
@@ -1778,7 +2025,9 @@ async function startEncoder(track, cfg) {
       view.setUint16(4, height);
       view.setBigUint64(6, BigInt(Math.max(0, Math.round(chunk.timestamp))));
       chunk.copyTo(buf.subarray(HEADER));
-      invoke(cfg.push, buf).catch(() => {});
+      invoke(cfg.push, buf)
+        .then((sent) => (idle = sent === 0))
+        .catch(() => {});
     },
     error: (e) => toast(`Video encoder error: ${e.message}`, { error: true }),
   });
@@ -1798,6 +2047,14 @@ async function startEncoder(track, cfg) {
     if (stopped || encoder.state !== "configured" || encoder.encodeQueueSize > 2) {
       frame.close();
       return;
+    }
+    if (idle && !forceKey) {
+      if (performance.now() - lastProbe < 2000) {
+        frame.close();
+        return;
+      }
+      lastProbe = performance.now();
+      forceKey = true;
     }
     const keyFrame = forceKey || frames % cfg.keyEvery === 0;
     forceKey = false;
@@ -1921,7 +2178,8 @@ async function cameraFrom(stream) {
 
 /** Moves a live camera to the newly chosen device without turning it off for others. */
 async function switchCamera() {
-  if (!state.camera) return;
+  const old = state.camera;
+  if (!old) return;
   let stream;
   try {
     stream = await openCamera();
@@ -1929,8 +2187,14 @@ async function switchCamera() {
     toast(`Couldn't open that camera: ${e.message || e.name}`, { error: true });
     return;
   }
-  state.camera.stop();
-  state.camera = await cameraFrom(stream);
+  const next = await cameraFrom(stream);
+  // The camera was turned off (or switched again) while this one was opening.
+  if (state.camera !== old) {
+    next.stop();
+    return;
+  }
+  old.stop();
+  state.camera = next;
   renderCall();
 }
 
@@ -1961,6 +2225,11 @@ function makeViewer(id) {
     v.codecId = codecId;
     v.decoder = new VideoDecoder({
       output: (frame) => {
+        // Decode everything (later frames depend on it) but only draw what can be seen.
+        if (v.frames > 0 && (document.hidden || !canvas.isConnected)) {
+          frame.close();
+          return;
+        }
         if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
         if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
         ctx.drawImage(frame, 0, 0);

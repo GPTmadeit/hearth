@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -30,6 +30,8 @@ const PRIME: usize = FRAME * 2;
 /// ...and drop old audio if the queue grows past this, to cap latency.
 const MAX_QUEUE: usize = RATE as usize / 5;
 const GATE_HOLD: Duration = Duration::from_millis(300);
+/// A speaker whose packet numbers jump back this far has restarted (rejoined).
+const RESTART_PACKETS: u32 = 50;
 
 pub enum Input {
     Microphone,
@@ -100,6 +102,8 @@ pub struct Controls {
     /// Our input level in dBFS × 100 (as bits of an f32), and whether the gate is open.
     level: AtomicU32,
     pub transmitting: AtomicBool,
+    sent_packets: AtomicU64,
+    sent_bytes: AtomicU64,
 }
 
 impl Controls {
@@ -110,6 +114,34 @@ impl Controls {
 
 /// A device change for the device thread, and where to send its warnings or error.
 type Switch = (Devices, mpsc::Sender<Result<Vec<String>, String>>);
+
+/// Call quality, for the stats graph. Counters are totals since joining.
+#[derive(Clone, Debug, Default)]
+pub struct CallStats {
+    pub input_db: f32,
+    pub transmitting: bool,
+    pub sent_packets: u64,
+    pub sent_bytes: u64,
+    pub peers: Vec<PeerStats>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerStats {
+    pub peer: PeerId,
+    pub rtt: Option<Duration>,
+    pub relay: bool,
+    pub received: u64,
+    pub received_bytes: u64,
+    /// Packets that never arrived (and were concealed).
+    pub lost: u64,
+    /// Packets that arrived too late or twice, and were dropped.
+    pub late: u64,
+    /// How unevenly packets arrive (RFC 3550 interarrival jitter).
+    pub jitter: Duration,
+    /// Audio queued to play, i.e. the jitter buffer's current delay.
+    pub buffered: Duration,
+    pub level_db: f32,
+}
 
 /// A running voice connection. Dropping it stops all audio.
 pub struct Audio {
@@ -234,6 +266,37 @@ impl Audio {
         self.sender.clone()
     }
 
+    pub fn stats(&self) -> CallStats {
+        let links = self.sender.links();
+        let mixer = self.mixer.lock().expect("mixer");
+        let peers = links
+            .into_iter()
+            .map(|l| {
+                let s = mixer.peers.get(&l.peer);
+                PeerStats {
+                    peer: l.peer,
+                    rtt: l.rtt,
+                    relay: l.relay,
+                    received: s.map_or(0, |s| s.received),
+                    received_bytes: s.map_or(0, |s| s.received_bytes),
+                    lost: s.map_or(0, |s| s.lost),
+                    late: s.map_or(0, |s| s.late),
+                    jitter: Duration::from_secs_f32(s.map_or(0.0, |s| s.jitter_ms) / 1000.0),
+                    buffered: Duration::from_secs_f64(s.map_or(0, |s| s.queue.len()) as f64 / RATE as f64),
+                    level_db: s.map_or(-100.0, |s| s.level_db),
+                }
+            })
+            .collect();
+        let c = &self.controls;
+        CallStats {
+            input_db: c.input_db(),
+            transmitting: c.transmitting.load(Ordering::Relaxed),
+            sent_packets: c.sent_packets.load(Ordering::Relaxed),
+            sent_bytes: c.sent_bytes.load(Ordering::Relaxed),
+            peers,
+        }
+    }
+
     /// Recent loudness per remote speaker (dBFS), for "who's talking" indicators.
     pub fn speaking(&self) -> Vec<(PeerId, f32)> {
         self.mixer.lock().expect("mixer").peers.iter().map(|(p, s)| (*p, s.level_db)).collect()
@@ -287,8 +350,10 @@ fn encode_loop(
         } else {
             let mut buf = captured.lock().expect("capture buffer");
             if buf.len() < FRAME {
+                // Sleep until a whole frame should have arrived, instead of spinning.
+                let missing = (FRAME - buf.len()) as u64;
                 drop(buf);
-                thread::sleep(Duration::from_millis(3));
+                thread::sleep(Duration::from_micros((missing * 1_000_000 / RATE as u64).max(1000)));
                 continue;
             }
             for s in frame.iter_mut() {
@@ -305,7 +370,10 @@ fn encode_loop(
         controls.transmitting.store(transmit, Ordering::Relaxed);
         if transmit {
             let n = enc.encode_float(&frame, &mut packet)?;
-            session.send(KIND_AUDIO, &packet[..n]);
+            if session.send(KIND_AUDIO, &packet[..n]) > 0 {
+                controls.sent_packets.fetch_add(1, Ordering::Relaxed);
+                controls.sent_bytes.fetch_add(n as u64, Ordering::Relaxed);
+            }
         }
     }
     Ok(())
@@ -338,6 +406,22 @@ struct Speaker {
     queue: VecDeque<f32>,
     primed: bool,
     level_db: f32,
+    received: u64,
+    received_bytes: u64,
+    lost: u64,
+    late: u64,
+    last_arrival: Option<Instant>,
+    jitter_ms: f32,
+}
+
+impl Speaker {
+    fn reset(&mut self) {
+        self.decoder.reset_state().ok();
+        self.last_seq = None;
+        self.last_arrival = None;
+        self.queue.clear();
+        self.primed = false;
+    }
 }
 
 #[derive(Default)]
@@ -355,15 +439,43 @@ impl Mixer {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
                 let Ok(decoder) = opus::Decoder::new(RATE, opus::Channels::Mono) else { return };
-                v.insert(Speaker { decoder, last_seq: None, queue: VecDeque::new(), primed: false, level_db: -100.0 })
+                v.insert(Speaker {
+                    decoder,
+                    last_seq: None,
+                    queue: VecDeque::new(),
+                    primed: false,
+                    level_db: -100.0,
+                    received: 0,
+                    received_bytes: 0,
+                    lost: 0,
+                    late: 0,
+                    last_arrival: None,
+                    jitter_ms: 0.0,
+                })
             }
         };
-        let gap = speaker.last_seq.map(|l| seq.wrapping_sub(l)).unwrap_or(1);
+        let mut gap = speaker.last_seq.map(|l| seq.wrapping_sub(l)).unwrap_or(1);
+        if gap > u32::MAX / 2 && gap.wrapping_neg() > RESTART_PACKETS {
+            // Far behind: they left and rejoined, numbering from scratch. Start fresh.
+            speaker.reset();
+            gap = 1;
+        }
         if gap == 0 || gap > u32::MAX / 2 {
+            speaker.late += 1;
             return; // duplicate or late
         }
+        speaker.received += 1;
+        speaker.received_bytes += packet.len() as u64;
+        let now = Instant::now();
+        if let (1, Some(last)) = (gap, speaker.last_arrival) {
+            // Consecutive packets are sent 20 ms apart; how far off was this one?
+            let d = (now.duration_since(last).as_secs_f32() * 1000.0 - 20.0).abs();
+            speaker.jitter_ms += (d - speaker.jitter_ms) / 16.0;
+        }
+        speaker.last_arrival = Some(now);
         // The gate stops packets during silence; only conceal genuine short losses.
         if (2..=5).contains(&gap) {
+            speaker.lost += u64::from(gap - 1);
             for _ in 0..gap - 2 {
                 if let Ok(n) = speaker.decoder.decode_float(&[], &mut self.scratch[..FRAME], false) {
                     speaker.queue.extend(&self.scratch[..n]);
@@ -618,5 +730,33 @@ mod tests {
         assert!(rms_db(&out) > -30.0, "should hear the tone");
         m.pull(&mut out, true);
         assert!(out.iter().all(|s| *s == 0.0), "deafened");
+    }
+
+    #[test]
+    fn mixer_hears_a_speaker_who_rejoined() {
+        let mut enc = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let tone: Vec<f32> = (0..FRAME).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
+        let mut pkt = vec![0u8; 4000];
+        let peer = hearth_core::SecretKey::generate().public();
+        let mut m = Mixer::default();
+        let mut push = |m: &mut Mixer, seq| {
+            let n = enc.encode_float(&tone, &mut pkt).unwrap();
+            m.push(peer, seq, &pkt[..n]);
+        };
+        for seq in 1000..1010 {
+            push(&mut m, seq);
+        }
+        let mut out = vec![0f32; FRAME];
+        while !m.peers[&peer].queue.is_empty() {
+            m.pull(&mut out, false);
+        }
+        // They left and came back: numbering restarts at 1.
+        for seq in 1..4 {
+            push(&mut m, seq);
+        }
+        assert_eq!(m.peers[&peer].queue.len(), FRAME * 3, "rejoined speaker must be heard");
+        // A merely late packet is still dropped.
+        push(&mut m, 2);
+        assert_eq!(m.peers[&peer].queue.len(), FRAME * 3);
     }
 }

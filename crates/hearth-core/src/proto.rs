@@ -54,6 +54,8 @@ pub enum Frame {
     Profile { name: String, avatar: Option<BlobRef> },
     /// Full voice state (0.3+). Sent after the legacy `Voice` frame, which older peers still read.
     VoiceState { server: ServerId, channel: Option<EventId>, live: bool, camera: bool, muted: bool, deafened: bool },
+    /// "Let me into `server`": presents an invite code the receiver (the owner) made.
+    JoinRequest { server: ServerId, code: [u8; 16] },
 }
 
 pub async fn write(send: &mut SendStream, frame: &Frame) -> Result<()> {

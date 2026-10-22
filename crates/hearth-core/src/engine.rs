@@ -23,6 +23,7 @@ use crate::{
     blob::{self, BlobRef, BlobStore},
     crypto,
     event::{AdminOp, Attachment, ChannelKind, Content, Event, EventId, ServerId},
+    link::{InviteCode, Link as ShareLink},
     media::{MediaHub, RoomConfig, VoiceSession},
     proto::{self, ALPN, Frame},
     state::{Change, Channel, ChatMessage, ServerState, key_hash},
@@ -34,6 +35,8 @@ const MAX_BODY: usize = 4000;
 const MAX_ATTACHMENTS: usize = 10;
 const BLOB_TIMEOUT: Duration = Duration::from_secs(120);
 const RECONNECT_EVERY: Duration = Duration::from_secs(30);
+/// Store key for the invite codes we've made.
+const INVITE_CODES: &str = "invite-codes";
 
 pub struct Config {
     pub secret: SecretKey,
@@ -82,6 +85,8 @@ pub enum Update {
     Profile { peer: PeerId },
     /// We left (or were removed from) a server and dropped our copy.
     ServerRemoved { server: ServerId },
+    /// An invite code we used was accepted; the server is syncing in.
+    Joined { server: ServerId },
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +177,8 @@ impl Hearth {
             dms: HashMap::new(),
             avatars: HashMap::new(),
             my_avatar: None,
+            invite_codes: HashMap::new(),
+            join_requests: HashSet::new(),
             updates,
             inbox: inbox.clone(),
             endpoint: endpoint.clone(),
@@ -382,6 +389,28 @@ impl Hearth {
         self.call(move |e| e.remove_friend(peer)).await?
     }
 
+    /// Makes a link (for a QR code) that lets anyone who has it join `server`
+    /// for the next `valid` duration. Only the owner can let people in.
+    pub async fn invite_link(&self, server: ServerId, valid: Duration) -> Result<ShareLink> {
+        self.call(move |e| e.invite_link(server, valid)).await?
+    }
+
+    /// Invalidates every invite code made for `server`. Returns how many there were.
+    pub async fn revoke_invite_links(&self, server: ServerId) -> Result<usize> {
+        self.call(move |e| {
+            let before = e.invite_codes.len();
+            e.invite_codes.retain(|_, (s, _)| *s != server);
+            e.save_invite_codes()?;
+            Ok(before - e.invite_codes.len())
+        })
+        .await?
+    }
+
+    /// Acts on a scanned or pasted link: sends a friend request, or asks to join a server.
+    pub async fn open_link(&self, link: ShareLink) -> Result<()> {
+        self.call(move |e| e.open_link(link)).await?
+    }
+
     pub async fn block(&self, peer: PeerId, blocked: bool) -> Result<()> {
         self.call(move |e| e.block(peer, blocked)).await?
     }
@@ -498,6 +527,10 @@ struct Engine {
     dms: HashMap<ServerId, PeerId>,
     avatars: HashMap<PeerId, BlobRef>,
     my_avatar: Option<BlobRef>,
+    /// Invite codes we made: code -> (server, expiry in ms since the epoch).
+    invite_codes: HashMap<InviteCode, (ServerId, u64)>,
+    /// Servers we've asked to join with a code; their invite is accepted automatically.
+    join_requests: HashSet<ServerId>,
     updates: mpsc::UnboundedSender<Update>,
     inbox: mpsc::UnboundedSender<Inbox>,
     endpoint: Endpoint,
@@ -530,6 +563,8 @@ impl Engine {
         self.friends = self.store.friends()?.into_iter().collect();
         self.dms = self.store.dms()?.into_iter().collect();
         self.avatars = self.store.avatars()?.into_iter().collect();
+        let codes: Vec<(InviteCode, ServerId, u64)> = self.store.meta(INVITE_CODES)?.unwrap_or_default();
+        self.invite_codes = codes.into_iter().filter(|c| c.2 > now_ms()).map(|(c, s, t)| (c, (s, t))).collect();
         self.my_avatar = self.store.meta("avatar")?;
         Ok(())
     }
@@ -721,8 +756,14 @@ impl Engine {
                 self.emit(Update::Profile { peer });
             }
             Frame::Dm { body, sent_at_ms } => self.emit(Update::Dm { peer, body, sent_at_ms }),
+            Frame::JoinRequest { server, code } => self.on_join_request(peer, server, code)?,
             Frame::Invite { server, name } => {
                 if self.servers.contains_key(&server) {
+                    return Ok(());
+                }
+                if self.join_requests.remove(&server) {
+                    self.join(server, peer)?;
+                    self.emit(Update::Joined { server });
                     return Ok(());
                 }
                 if self.dms.get(&server) == Some(&peer) {
@@ -922,6 +963,46 @@ impl Engine {
             self.author_admin(server, AdminOp::Add { peer })?;
         }
         self.deliver_invite(server, peer)
+    }
+
+    fn invite_link(&mut self, server: ServerId, valid: Duration) -> Result<ShareLink> {
+        if self.server(server)?.owner() != Some(self.me()) {
+            bail!("only the server's owner can make invite codes");
+        }
+        let code: InviteCode = rand::random();
+        let expires = now_ms() + valid.as_millis() as u64;
+        self.invite_codes.retain(|_, (_, t)| *t > now_ms());
+        self.invite_codes.insert(code, (server, expires));
+        self.save_invite_codes()?;
+        Ok(ShareLink::Join { server, via: self.me(), code })
+    }
+
+    fn save_invite_codes(&self) -> Result<()> {
+        let codes: Vec<(InviteCode, ServerId, u64)> = self.invite_codes.iter().map(|(c, (s, t))| (*c, *s, *t)).collect();
+        self.store.put_meta(INVITE_CODES, &codes)
+    }
+
+    fn open_link(&mut self, link: ShareLink) -> Result<()> {
+        match link {
+            ShareLink::Friend(peer) if peer == self.me() => bail!("that's your own code"),
+            ShareLink::Friend(peer) => self.add_friend(peer),
+            ShareLink::Join { server, .. } if self.servers.contains_key(&server) => bail!("you're already in that server"),
+            ShareLink::Join { server, via, code } => {
+                self.join_requests.insert(server);
+                self.send_or_queue(via, Frame::JoinRequest { server, code })
+            }
+        }
+    }
+
+    fn on_join_request(&mut self, peer: PeerId, server: ServerId, code: InviteCode) -> Result<()> {
+        match self.invite_codes.get(&code) {
+            Some((s, expires)) if *s == server && *expires > now_ms() => {}
+            _ => return Ok(()), // unknown, expired, or for another server: ignore
+        }
+        if self.is_blocked(&peer) || self.server(server)?.owner() != Some(self.me()) {
+            return Ok(());
+        }
+        self.invite(server, peer)
     }
 
     /// Hosting is invite-shaped too: the node joins through whoever asked it.

@@ -33,6 +33,13 @@ that never leaves your device.
   (⚙ in the call bar, or in settings), including mid-call. Choices are
   remembered; if a chosen device is unplugged, the system default is used.
   In the CLI: `/devices`, `/mic <n>`, `/speakers <n>`.
+- **QR codes**: show your friend code, or (as a server owner) an invite code
+  valid for 24 hours; scan one with your camera to add a friend or join a
+  server. Owners can cancel all invite codes at once. Links work too
+  (`hearth://friend/…`, `hearth://join/…`). CLI: `/id`, `/link`, `/open`.
+- **Call quality**: a live graph of ping and packet loss per person, plus
+  path (direct or relay), jitter, buffer and bitrate, in Voice & video
+  settings. CLI: `/stats`.
 - **Voice**: Opus at 64 kbps with forward error correction over QUIC datagrams,
   with a jitter buffer and loss concealment. Mute and deafen. Speaking rings
   show for everyone in the server, not just people in the call. If there's no
@@ -165,10 +172,17 @@ relays, storage nodes and network observers. Be aware of these limits:
 
 ```sh
 cargo test --workspace
+python3 crates/hearth-desktop/ui-test/run.py           # UI flows in headless Chromium
+cargo build --release -p hearth-cli
+python3 scripts/e2e.py target/release/hearth           # real peers over the internet
+python3 scripts/soundcheck.py target/release/hearth    # calls through joins/leaves/rejoins
+python3 scripts/soundcheck.py target/release/hearth --soak 600   # + 10 min longevity
 ```
 
 The CLI accepts `--tone <hz>` and `--record <file.wav>`, which make voice
-testable without a microphone.
+testable without a microphone. The sound check gives each peer its own tone
+and checks every 20 ms of every recording for exactly the people who should
+be audible at that moment.
 
 ## License
 

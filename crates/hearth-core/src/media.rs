@@ -8,7 +8,8 @@
 //! channel, so only members can decode media even if it is ever forwarded.
 //!
 //! Datagram layout: `version(1) | tag(8) | epoch(4) | nonce(24) | ciphertext`,
-//! where the plaintext is `kind(1) | seq(4) | payload`.
+//! where the plaintext is `kind(1) | seq(4) | payload`. Each kind has its own
+//! sequence numbers, so a receiver can tell lost audio from video in between.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -40,6 +41,16 @@ pub const KIND_CAMERA: u8 = 3;
 /// Video frames allowed in flight per viewer before non-key frames are skipped.
 const MAX_INFLIGHT: usize = 4;
 pub const MAX_VIDEO_FRAME: usize = 8 * 1024 * 1024;
+
+/// How we reach someone in the call.
+#[derive(Debug, Clone)]
+pub struct Link {
+    pub peer: PeerId,
+    /// Round-trip time on the path in use.
+    pub rtt: Option<std::time::Duration>,
+    /// Through a relay server rather than directly (hole-punching hasn't worked, yet).
+    pub relay: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct MediaPacket {
@@ -75,7 +86,10 @@ fn aad(tag: &[u8; 8], epoch: u32, sender: &PeerId) -> [u8; 44] {
     out
 }
 
-/// Sliding window of recently seen sequence numbers, per sender.
+/// How far behind a sequence number must be to count as the sender restarting.
+const RESTART: u32 = 1000;
+
+/// Sliding window of recently seen sequence numbers, per sender and kind.
 #[derive(Debug, Default)]
 struct Replay {
     highest: Option<u32>,
@@ -96,6 +110,13 @@ impl Replay {
             return true;
         }
         let back = high - seq;
+        // Far behind means the sender started over (it left and rejoined). Only
+        // that peer can send on its authenticated connection, so this isn't a
+        // replay from the network.
+        if back > RESTART {
+            *self = Self::default();
+            return self.accept(seq);
+        }
         if back >= 64 || self.window & (1 << back) != 0 {
             return false;
         }
@@ -127,17 +148,18 @@ struct Room {
     peers: HashMap<PeerId, Connection>,
     watchers: HashSet<PeerId>,
     inflight: HashMap<(u8, PeerId), Arc<AtomicUsize>>,
-    seq: u32,
-    replay: HashMap<PeerId, Replay>,
+    seq: HashMap<u8, u32>,
+    replay: HashMap<(PeerId, u8), Replay>,
 }
 
 impl Room {
     fn seal(&mut self, kind: u8, payload: &[u8]) -> Option<Bytes> {
         let key = self.keys.get(&self.epoch)?;
-        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq.entry(kind).or_default();
+        *seq = seq.wrapping_add(1);
         let mut plaintext = Vec::with_capacity(5 + payload.len());
         plaintext.push(kind);
-        plaintext.extend_from_slice(&self.seq.to_be_bytes());
+        plaintext.extend_from_slice(&seq.to_be_bytes());
         plaintext.extend_from_slice(payload);
         let nonce = crypto::random_nonce();
         let ct = crypto::seal(key, &nonce, &aad(&self.tag, self.epoch, &self.me), &plaintext);
@@ -181,7 +203,7 @@ impl MediaHub {
             Some(r) if r.tag == tag => {
                 r.epoch = cfg.epoch;
                 r.keys = keys;
-                r.replay.retain(|p, _| peers.contains_key(p));
+                r.replay.retain(|(p, _), _| peers.contains_key(p));
                 r.inflight.retain(|(_, p), _| peers.contains_key(p));
                 r.peers = peers;
                 r.watchers = watchers;
@@ -195,7 +217,7 @@ impl MediaHub {
                     peers,
                     watchers,
                     inflight: HashMap::new(),
-                    seq: 0,
+                    seq: HashMap::new(),
                     replay: HashMap::new(),
                 })
             }
@@ -265,6 +287,24 @@ impl MediaHub {
         sent
     }
 
+    /// The connection to each peer in the call.
+    pub fn links(&self) -> Vec<Link> {
+        let guard = self.room.lock().expect("media lock");
+        let Some(room) = guard.as_ref() else { return Vec::new() };
+        room.peers
+            .iter()
+            .map(|(peer, conn)| {
+                let paths = conn.paths();
+                let selected = paths.iter().find(|p| p.is_selected());
+                Link {
+                    peer: *peer,
+                    rtt: selected.as_ref().and_then(|p| conn.rtt(p.id())),
+                    relay: selected.is_some_and(|p| p.is_relay()),
+                }
+            })
+            .collect()
+    }
+
     /// Handles a datagram from `from`; anything not for our room, from a peer
     /// outside it, replayed, or failing authentication is dropped.
     pub(crate) fn receive(&self, from: PeerId, data: &[u8]) {
@@ -295,7 +335,7 @@ impl MediaHub {
             return None;
         }
         let seq = u32::from_be_bytes(plaintext[1..5].try_into().ok()?);
-        if !room.replay.entry(from).or_default().accept(seq) {
+        if !room.replay.entry((from, plaintext[0])).or_default().accept(seq) {
             return None;
         }
         Some(MediaPacket { from, kind: plaintext[0], seq, payload: plaintext[5..].to_vec() })
@@ -339,6 +379,11 @@ impl MediaSender {
     pub fn send_camera(&self, payload: &[u8], keyframe: bool) -> usize {
         self.hub.send_camera(payload, keyframe)
     }
+
+    /// See [`MediaHub::links`].
+    pub fn links(&self) -> Vec<Link> {
+        self.hub.links()
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +400,10 @@ mod tests {
         assert!(!r.accept(11));
         assert!(r.accept(200));
         assert!(!r.accept(100), "too old");
+        assert!(r.accept(5000));
+        assert!(r.accept(1), "a sender that started over is heard again");
+        assert!(r.accept(2));
+        assert!(!r.accept(1));
     }
 
     #[test]

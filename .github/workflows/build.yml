@@ -35,6 +35,8 @@ jobs:
       - run: cargo build --release -p hearth-cli
       - name: End-to-end over the real network
         run: python3 scripts/e2e.py target/release/hearth
+      - name: Sound check (people joining, leaving, rejoining, cameras)
+        run: python3 scripts/soundcheck.py target/release/hearth
       - name: Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
       - name: Desktop AppImage
@@ -64,6 +66,8 @@ jobs:
       - run: cargo build --release -p hearth-cli
       - name: End-to-end over the real network
         run: python scripts/e2e.py target/release/hearth.exe
+      - name: Sound check (people joining, leaving, rejoining, cameras)
+        run: python scripts/soundcheck.py target/release/hearth.exe
       - name: Tauri CLI
         run: cargo install tauri-cli --version "^2" --locked
       - name: Desktop installers
