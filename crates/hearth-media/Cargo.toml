@@ -1,0 +1,11 @@
+[package]
+name = "hearth-media"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+hearth-core = { version = "0.1.0", path = "../hearth-core" }
+hound = "3.5.1"
+opus = "0.4.0"

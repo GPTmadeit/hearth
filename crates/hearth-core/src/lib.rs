@@ -9,12 +9,14 @@ pub mod crypto;
 pub mod engine;
 pub mod event;
 pub mod identity;
+pub mod media;
 pub mod proto;
 pub mod state;
 pub mod store;
 
 pub use engine::{Config, Hearth, HostPolicy, ServerSummary, Update};
 pub use iroh::RelayUrl;
+pub use media::{KIND_AUDIO, MediaPacket, MediaSender, VoiceSession};
 pub use event::{ChannelKind, EventId, ServerId};
 pub use iroh::{EndpointId as PeerId, SecretKey};
 pub use state::{Change, Channel, ChatMessage};

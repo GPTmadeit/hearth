@@ -4,7 +4,10 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     crypto,
     event::{AdminOp, ChannelKind, Content, Event, EventId, ServerId},
+    media::{MediaHub, RoomConfig, VoiceSession},
     proto::{self, ALPN, Frame},
     state::{Change, Channel, ChatMessage, ServerState, key_hash},
     store::Store,
@@ -52,6 +56,8 @@ pub enum Update {
     Dm { peer: PeerId, body: String, sent_at_ms: u64 },
     Invited { server: ServerId, from: PeerId, name: String },
     Server { server: ServerId, change: Change },
+    /// Who is in a voice channel now.
+    Voice { server: ServerId, channel: EventId, peers: Vec<PeerId> },
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +100,8 @@ impl Hearth {
         let (inbox, inbox_rx) = mpsc::unbounded_channel();
         let (updates, updates_rx) = mpsc::unbounded_channel();
 
-        let handler = Accept { name: cfg.name.clone(), inbox: inbox.clone() };
+        let media = Arc::new(MediaHub::default());
+        let handler = Accept { name: cfg.name.clone(), inbox: inbox.clone(), media: media.clone() };
         let router = Router::builder(endpoint.clone()).accept(ALPN, handler).spawn();
 
         let mut engine = Engine {
@@ -106,6 +113,9 @@ impl Hearth {
             persisted_keys: HashSet::new(),
             peers: HashMap::new(),
             dialing: HashSet::new(),
+            media,
+            voice: HashMap::new(),
+            my_voice: None,
             updates,
             inbox: inbox.clone(),
             endpoint: endpoint.clone(),
@@ -201,6 +211,27 @@ impl Hearth {
         .await
     }
 
+    /// Joins a voice channel (leaving any other). Media flows through the returned session.
+    pub async fn voice_join(&self, server: ServerId, channel: EventId) -> Result<VoiceSession> {
+        self.call(move |e| e.voice_join(server, channel)).await?
+    }
+
+    pub async fn voice_leave(&self) -> Result<()> {
+        self.call(|e| e.voice_leave()).await
+    }
+
+    /// Who's in each voice channel of `server` right now.
+    pub async fn voice_state(&self, server: ServerId) -> Result<HashMap<EventId, Vec<PeerId>>> {
+        self.call(move |e| {
+            let mut out: HashMap<EventId, Vec<PeerId>> = HashMap::new();
+            for (p, c) in e.voice.get(&server).into_iter().flatten() {
+                out.entry(*c).or_default().push(*p);
+            }
+            out
+        })
+        .await
+    }
+
     /// Every display name we've seen, including peers who are offline now.
     pub async fn known_names(&self) -> Result<Vec<(PeerId, String)>> {
         self.call(|e| e.store.names().unwrap_or_default()).await
@@ -240,6 +271,10 @@ struct Engine {
     persisted_keys: HashSet<(ServerId, u32)>,
     peers: HashMap<PeerId, PeerConn>,
     dialing: HashSet<PeerId>,
+    media: Arc<MediaHub>,
+    /// Per server: which voice channel each connected member is in.
+    voice: HashMap<ServerId, HashMap<PeerId, EventId>>,
+    my_voice: Option<(ServerId, EventId)>,
     updates: mpsc::UnboundedSender<Update>,
     inbox: mpsc::UnboundedSender<Inbox>,
     endpoint: Endpoint,
@@ -289,6 +324,7 @@ impl Engine {
                     if self.peers.get(&peer).is_some_and(|p| p.id == id) {
                         self.peers.remove(&peer);
                         self.emit(Update::PeerOffline { peer });
+                        self.set_voice(None, peer, None);
                     }
                 }
                 Inbox::Tick => self.reconnect(),
@@ -313,6 +349,7 @@ impl Engine {
             return;
         }
         let (endpoint, inbox, name) = (self.endpoint.clone(), self.inbox.clone(), self.name.clone());
+        let media = self.media.clone();
         tokio::spawn(async move {
             let result = async {
                 let conn = endpoint.connect(peer, ALPN).await?;
@@ -325,7 +362,7 @@ impl Engine {
                 e.dialing.remove(&peer);
             })));
             if let Ok((conn, send, recv)) = result {
-                let _ = drive(conn, send, recv, name, true, inbox2).await;
+                let _ = drive(conn, send, recv, name, true, inbox2, media).await;
             }
         });
     }
@@ -364,6 +401,12 @@ impl Engine {
                 self.send_have(&peer, id);
             }
         }
+        if let Some((server, channel)) = self.my_voice
+            && self.servers[&server].is_member(&peer)
+        {
+            self.send_to(&peer, Frame::Voice { server, channel: Some(channel) });
+        }
+        self.refresh_media();
     }
 
     fn send_have(&self, peer: &PeerId, id: ServerId) {
@@ -390,6 +433,11 @@ impl Engine {
                     }
                     Some(_) => {}
                     None => self.emit(Update::Invited { server, from: peer, name }),
+                }
+            }
+            Frame::Voice { server, channel } => {
+                if self.servers.get(&server).is_some_and(|s| s.is_member(&peer)) {
+                    self.set_voice(Some(server), peer, channel);
                 }
             }
             Frame::Removed { server } => {
@@ -490,6 +538,15 @@ impl Engine {
         for change in changes {
             if let Change::MemberAdded(peer) | Change::HostAdded(peer) = &change {
                 self.dial(*peer);
+            }
+            if let Change::MemberRemoved(peer) = &change {
+                if *peer == self.me() {
+                    self.voice_leave();
+                }
+                self.set_voice(Some(server), *peer, None);
+            }
+            if let Change::Epoch(_) = &change {
+                self.refresh_media();
             }
             self.emit(Update::Server { server, change });
         }
@@ -628,6 +685,90 @@ impl Engine {
         Ok(())
     }
 
+    fn voice_join(&mut self, server: ServerId, channel: EventId) -> Result<VoiceSession> {
+        let s = self.server(server)?;
+        if !s.is_member(&self.me()) {
+            bail!("not a member of this server");
+        }
+        match s.channels.get(&channel) {
+            Some(c) if c.kind == ChannelKind::Voice => {}
+            Some(_) => bail!("that's a text channel"),
+            None => bail!("unknown channel"),
+        }
+        self.voice_leave();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.media.set_sink(Some(tx));
+        self.my_voice = Some((server, channel));
+        let me = self.me();
+        self.set_voice(Some(server), me, Some(channel));
+        Ok(VoiceSession { hub: self.media.clone(), incoming: rx })
+    }
+
+    fn voice_leave(&mut self) {
+        let Some((server, _)) = self.my_voice.take() else { return };
+        self.media.set_sink(None);
+        let me = self.me();
+        self.set_voice(Some(server), me, None);
+    }
+
+    /// Records `peer`'s voice channel in `server` (or in every server when
+    /// `None`), tells the UI, and for our own moves tells other members.
+    fn set_voice(&mut self, server: Option<ServerId>, peer: PeerId, channel: Option<EventId>) {
+        let servers: Vec<ServerId> = match server {
+            Some(s) => vec![s],
+            None => self.voice.keys().copied().collect(),
+        };
+        for sid in servers {
+            let rooms = self.voice.entry(sid).or_default();
+            let before = rooms.get(&peer).copied();
+            if before == channel {
+                continue;
+            }
+            match channel {
+                Some(c) => rooms.insert(peer, c),
+                None => rooms.remove(&peer),
+            };
+            for c in [before, channel].into_iter().flatten() {
+                let peers = rooms.iter().filter(|(_, rc)| **rc == c).map(|(p, _)| *p).collect();
+                let _ = self.updates.send(Update::Voice { server: sid, channel: c, peers });
+            }
+            if peer == self.me()
+                && let Some(s) = self.servers.get(&sid)
+            {
+                for m in s.members() {
+                    self.send_to(&m, Frame::Voice { server: sid, channel });
+                }
+            }
+        }
+        self.refresh_media();
+    }
+
+    /// Points the media hub at the members currently sharing our voice channel.
+    fn refresh_media(&self) {
+        let Some((sid, channel)) = self.my_voice else {
+            self.media.configure(None);
+            return;
+        };
+        let Some(s) = self.servers.get(&sid) else { return };
+        let me = self.me();
+        let peers = self
+            .voice
+            .get(&sid)
+            .into_iter()
+            .flatten()
+            .filter(|(p, c)| **c == channel && **p != me && s.is_member(p))
+            .filter_map(|(p, _)| self.peers.get(p).map(|pc| (*p, pc.conn.clone())))
+            .collect();
+        self.media.configure(Some(RoomConfig {
+            server: sid,
+            channel,
+            me,
+            epoch: s.epoch(),
+            keys: s.keys().clone(),
+            peers,
+        }));
+    }
+
     fn dm(&mut self, peer: PeerId, body: String) -> Result<()> {
         if !self.peers.contains_key(&peer) {
             self.dial(peer);
@@ -660,12 +801,13 @@ impl Engine {
 struct Accept {
     name: String,
     inbox: mpsc::UnboundedSender<Inbox>,
+    media: Arc<MediaHub>,
 }
 
 impl ProtocolHandler for Accept {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let (send, recv) = conn.accept_bi().await?;
-        let _ = drive(conn, send, recv, self.name.clone(), false, self.inbox.clone()).await;
+        let _ = drive(conn, send, recv, self.name.clone(), false, self.inbox.clone(), self.media.clone()).await;
         Ok(())
     }
 }
@@ -680,6 +822,7 @@ async fn drive(
     our_name: String,
     dialed: bool,
     inbox: mpsc::UnboundedSender<Inbox>,
+    media: Arc<MediaHub>,
 ) -> Result<()> {
     let peer = conn.remote_id();
     proto::write(&mut send, &Frame::Hello { name: our_name }).await?;
@@ -687,6 +830,13 @@ async fn drive(
         Some(Frame::Hello { name }) => name.chars().take(64).collect(),
         other => bail!("expected Hello, got {other:?}"),
     };
+
+    let datagrams = conn.clone();
+    tokio::spawn(async move {
+        while let Ok(data) = datagrams.read_datagram().await {
+            media.receive(peer, &data);
+        }
+    });
 
     let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
     let (out, mut out_rx) = mpsc::unbounded_channel::<Frame>();

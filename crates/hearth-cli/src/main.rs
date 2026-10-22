@@ -6,6 +6,7 @@ use hearth_core::{
     Change, ChannelKind, Config, EventId, Hearth, HostPolicy, PeerId, RelayUrl, ServerId, ServerSummary, Update,
     identity,
 };
+use hearth_media::{Audio, AudioOptions, Input, Output};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Parser)]
@@ -32,6 +33,12 @@ enum Cmd {
         name: String,
         /// Peer IDs to dial on startup.
         peers: Vec<PeerId>,
+        /// Send a test tone instead of your microphone in voice channels.
+        #[arg(long, value_name = "HZ")]
+        tone: Option<f32>,
+        /// Write voice audio to this WAV file instead of the speakers.
+        #[arg(long, value_name = "FILE")]
+        record: Option<PathBuf>,
     },
     /// Run an always-on storage node. It stores and forwards servers'
     /// encrypted events for offline delivery, but never holds their keys.
@@ -50,7 +57,9 @@ commands:
   /invite <peer>           invite to server      /kick <peer>         remove + rotate key
   /invites                 pending invites       /accept <n>          join an invite
   /host <node>             add a storage node    /unhost <node>       remove it
-  /dm <peer> <text>        direct message        /peers               who's online
+  /voice [channel]         join voice           /leave               leave voice
+  /mute  /deafen           toggle mic/sound      /dm <peer> <text>    direct message
+  /peers                   who's online
   /history [n]             recent messages       /id                  your peer id
   /quit
 anything else is sent to the current channel. <peer> can be an id prefix or a name.";
@@ -66,10 +75,13 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Id => println!("{}", secret.public()),
-        Cmd::Chat { name, peers } => {
+        Cmd::Chat { name, peers, tone, record } => {
             let cfg = Config { secret, name, data_dir, relay: cli.relay, host: None };
             let (hearth, updates) = Hearth::start(cfg).await?;
-            Repl::new(hearth).run(updates, peers).await?;
+            let mut repl = Repl::new(hearth);
+            repl.tone = tone;
+            repl.record = record;
+            repl.run(updates, peers).await?;
         }
         Cmd::Node { allow } => {
             let host = Some(HostPolicy { allow });
@@ -108,11 +120,14 @@ struct Repl {
     names: HashMap<PeerId, String>,
     invites: Vec<(ServerId, PeerId, String)>,
     current: Option<(ServerId, EventId)>,
+    audio: Option<Audio>,
+    tone: Option<f32>,
+    record: Option<PathBuf>,
 }
 
 impl Repl {
     fn new(hearth: Hearth) -> Self {
-        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None }
+        Self { hearth, names: HashMap::new(), invites: Vec::new(), current: None, audio: None, tone: None, record: None }
     }
 
     async fn run(mut self, mut updates: tokio::sync::mpsc::UnboundedReceiver<Update>, peers: Vec<PeerId>) -> Result<()> {
@@ -141,6 +156,7 @@ impl Repl {
                 Some(u) = updates.recv() => self.update(u).await,
             }
         }
+        self.audio = None;
         self.hearth.shutdown().await;
         Ok(())
     }
@@ -302,6 +318,47 @@ impl Repl {
                 self.hearth.join(server, from).await?;
                 println!("joining {name}...");
             }
+            "/voice" | "/v" => {
+                let s = self.current_server().await?;
+                let voice = s.channels.iter().filter(|c| c.kind == ChannelKind::Voice);
+                let ch = match rest {
+                    "" => voice.clone().next(),
+                    name => voice.clone().find(|c| c.name == name),
+                }
+                .context("no such voice channel")?;
+                self.audio = None;
+                let session = self.hearth.voice_join(s.id, ch.id).await?;
+                let opts = AudioOptions {
+                    input: self.tone.map_or(Input::Microphone, |hz| Input::Tone { hz }),
+                    output: self.record.clone().map_or(Output::Speakers, Output::Wav),
+                    ..Default::default()
+                };
+                match Audio::start(session, opts) {
+                    Ok(a) => {
+                        for w in &a.warnings {
+                            println!("! {w}");
+                        }
+                        self.audio = Some(a);
+                    }
+                    Err(e) => {
+                        self.hearth.voice_leave().await?;
+                        return Err(e.context("starting audio"));
+                    }
+                }
+                println!("🔊 joined {} (/mute, /deafen, /leave)", ch.name);
+            }
+            "/leave" => {
+                self.audio = None;
+                self.hearth.voice_leave().await?;
+                println!("left voice");
+            }
+            "/mute" | "/deafen" => {
+                let a = self.audio.as_ref().context("not in voice")?;
+                let flag = if cmd == "/mute" { &a.controls.muted } else { &a.controls.deafened };
+                let on = !flag.load(std::sync::atomic::Ordering::Relaxed);
+                flag.store(on, std::sync::atomic::Ordering::Relaxed);
+                println!("{} {}", &cmd[1..], if on { "on" } else { "off" });
+            }
             "/dm" => {
                 let (who, text) = rest.split_once(' ').context("usage: /dm <peer> <text>")?;
                 let peer = self.resolve_peer(who).await?;
@@ -339,6 +396,14 @@ impl Repl {
                 }
             }
             Update::Server { server, change } => self.server_change(server, change).await,
+            Update::Voice { server, channel, peers } => {
+                let Some(s) = self.hearth.servers().await.ok().and_then(|v| v.into_iter().find(|s| s.id == server)) else {
+                    return;
+                };
+                let ch = s.channels.iter().find(|c| c.id == channel).map(|c| c.name.clone()).unwrap_or_default();
+                let names: Vec<String> = peers.iter().map(|p| self.who(p)).collect();
+                println!("* 🔊{ch}: {}", if names.is_empty() { "(empty)".into() } else { names.join(", ") });
+            }
         }
     }
 
