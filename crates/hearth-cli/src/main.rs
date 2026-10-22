@@ -9,6 +9,8 @@ use hearth_core::{
 use hearth_media::{Audio, AudioOptions, Input, Output};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod update;
+
 #[derive(Parser)]
 #[command(name = "hearth", about = "Peer-to-peer encrypted chat")]
 struct Cli {
@@ -49,6 +51,15 @@ enum Cmd {
         /// Only host servers for these owners (default: anyone who asks).
         #[arg(long)]
         allow: Vec<PeerId>,
+        /// Don't install new releases from GitHub automatically.
+        #[arg(long)]
+        no_auto_update: bool,
+    },
+    /// Update hearth to the latest signed release from GitHub.
+    Update {
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -79,7 +90,20 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Id => println!("{}", secret.public()),
+        Cmd::Update { check } => {
+            println!("hearth {}", env!("CARGO_PKG_VERSION"));
+            match update::check().await? {
+                None => println!("up to date"),
+                Some(u) if check => println!("{} is available: run `hearth update`", u.version),
+                Some(u) => {
+                    println!("downloading {}…", u.version);
+                    update::install(&u).await?;
+                    println!("updated to {}", u.version);
+                }
+            }
+        }
         Cmd::Chat { name, peers, tone, record, video_test } => {
+            notify_if_outdated();
             let cfg = Config { secret, name, data_dir, relay: cli.relay, host: None };
             let (hearth, updates) = Hearth::start(cfg).await?;
             let mut repl = Repl::new(hearth);
@@ -88,23 +112,53 @@ async fn main() -> Result<()> {
             repl.video_test = video_test;
             repl.run(updates, peers).await?;
         }
-        Cmd::Node { allow } => {
+        Cmd::Node { allow, no_auto_update } => {
             let host = Some(HostPolicy { allow });
             let cfg = Config { secret, name: "hearth-node".into(), data_dir, relay: cli.relay, host };
-            run_node(cfg).await?;
+            run_node(cfg, !no_auto_update).await?;
         }
     }
     Ok(())
 }
 
-async fn run_node(cfg: Config) -> Result<()> {
+/// Prints a one-line notice if GitHub has a newer release. Never blocks startup.
+fn notify_if_outdated() {
+    if std::env::var_os("HEARTH_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    tokio::spawn(async {
+        if let Ok(Ok(Some(u))) = tokio::time::timeout(std::time::Duration::from_secs(10), update::check()).await {
+            println!("* hearth {} is available: run `hearth update`", u.version);
+        }
+    });
+}
+
+const NODE_UPDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+async fn run_node(cfg: Config, auto_update: bool) -> Result<()> {
     let (hearth, mut updates) = Hearth::start(cfg).await?;
     println!("node id: {}", hearth.id());
     hearth.online().await;
     println!("online. owners can now run `/host {}`", hearth.id());
+    if auto_update {
+        println!("auto-update on: checking GitHub every 6 hours (--no-auto-update to disable)");
+    }
+    let mut update_tick = tokio::time::interval_at(tokio::time::Instant::now() + std::time::Duration::from_secs(60), NODE_UPDATE_EVERY);
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = update_tick.tick(), if auto_update => match update::check().await {
+                Ok(Some(u)) => match update::install(&u).await {
+                    Ok(()) => {
+                        println!("installed {}; restarting", u.version);
+                        hearth.shutdown().await;
+                        update::restart()?;
+                    }
+                    Err(e) => eprintln!("update to {} failed: {e:#}", u.version),
+                },
+                Ok(None) => {}
+                Err(e) => eprintln!("update check failed: {e:#}"),
+            },
             Some(u) = updates.recv() => match u {
                 Update::Invited { server, from, .. } => println!("hosting {} for {}", server.short(), from.fmt_short()),
                 Update::PeerOnline { peer, name } => println!("+ {name} {}", peer.fmt_short()),

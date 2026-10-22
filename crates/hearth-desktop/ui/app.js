@@ -91,7 +91,7 @@ async function call(cmd, args) {
     return await invoke(cmd, args);
   } catch (e) {
     toast(String(e), { error: true });
-    throw e;
+    throw Object.assign(new Error(String(e)), { shown: true });
   }
 }
 
@@ -130,7 +130,11 @@ function modal({ title, body = "", fields = [], submit = "OK", onSubmit, extra =
   const form = $("form", root);
   const close = () => (root.innerHTML = "");
   $("[data-cancel]", root).onclick = close;
-  $(".backdrop", root).onclick = (e) => e.target.classList.contains("backdrop") && close();
+  // A block body on purpose: an onclick property that returns false cancels the
+  // default action, which would stop the form's submit button from submitting.
+  $(".backdrop", root).onclick = (e) => {
+    if (e.target === e.currentTarget) close();
+  };
   root.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => copy(b.dataset.copy)));
   form.onsubmit = async (e) => {
     e.preventDefault();
@@ -142,8 +146,8 @@ function modal({ title, body = "", fields = [], submit = "OK", onSubmit, extra =
     try {
       await onSubmit(values);
       close();
-    } catch {
-      /* call() already showed the error */
+    } catch (err) {
+      if (!err?.shown) toast(String(err?.message || err), { error: true });
     }
   };
   form.querySelector("input")?.focus();
@@ -517,7 +521,7 @@ function createChannelModal(voice) {
     fields: [{ name: "name", label: "Channel name", placeholder: voice ? "Hangout" : "new-channel" }],
     submit: "Create",
     onSubmit: async ({ name }) => {
-      if (!name) throw new Error("name required");
+      if (!name) throw new Error("Give the channel a name");
       const id = await call("create_channel", { server: state.server, name, voice });
       await refreshServers();
       if (!voice) await selectChannel(id);
@@ -850,6 +854,30 @@ async function boot() {
   await invoke("video_channel", { channel: ch });
   await listen("hearth", (e) => onUpdate(e.payload));
   await refreshServers();
+  checkForUpdate();
+}
+
+// Ask GitHub for a newer release now and every few hours; offer a one-click update.
+async function checkForUpdate() {
+  try {
+    const update = await invoke("check_update");
+    if (update) {
+      toast(`Hearth ${update.version} is available (you have ${update.current}).`, {
+        action: installUpdate,
+        actionLabel: "Update",
+        timeout: 60_000,
+      });
+    }
+  } catch (e) {
+    console.warn("update check failed", e);
+  }
+  setTimeout(checkForUpdate, 6 * 60 * 60 * 1000);
+}
+
+async function installUpdate() {
+  if (state.inVoice) await leaveVoice().catch(() => {});
+  toast("Downloading update… Hearth will restart when it's done.", { timeout: 120_000 });
+  await call("install_update");
 }
 
 boot().catch((e) => {

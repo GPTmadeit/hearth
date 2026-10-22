@@ -52,6 +52,18 @@ cd crates\hearth-desktop
 cargo tauri build   # installers land in target\release\bundle\
 ```
 
+### Updating
+
+Hearth updates itself from this repo's GitHub releases. Every update is signed
+in CI and checked against a public key built into the app before it installs.
+
+- **Desktop app:** checks on launch and every 6 hours, then offers a one-click
+  update and restarts.
+- **CLI:** run `hearth update` (or `hearth update --check`). Chat prints a notice
+  when a newer version exists.
+- **Node:** installs updates automatically every 6 hours and restarts in place.
+  Turn this off with `--no-auto-update`.
+
 ### Always-on node and relay
 
 ```sh

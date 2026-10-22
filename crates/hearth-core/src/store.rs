@@ -28,7 +28,18 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let db = Database::create(path)?;
+        // A process restarting itself (e.g. after an update) can briefly race the
+        // old one for the lock, so retry for a few seconds before giving up.
+        let mut attempts = 0;
+        let db = loop {
+            match Database::create(path) {
+                Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempts < 50 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                other => break other?,
+            }
+        };
         let tx = db.begin_write()?;
         tx.open_table(EVENTS)?;
         tx.open_table(KEYS)?;

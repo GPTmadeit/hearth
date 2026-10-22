@@ -36,6 +36,7 @@ class Peer:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env={**os.environ, "HEARTH_NO_UPDATE_CHECK": "1"},
         )
         threading.Thread(target=self._pump, daemon=True).start()
 

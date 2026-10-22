@@ -13,9 +13,10 @@ use hearth_core::{
 use hearth_media::{Audio, AudioOptions};
 use serde::{Deserialize, Serialize};
 use tauri::{
-    Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State,
     ipc::{Channel, InvokeBody, InvokeResponseBody, Request},
 };
+use tauri_plugin_updater::UpdaterExt;
 
 type Res<T> = Result<T, String>;
 
@@ -356,8 +357,42 @@ async fn push_video(app: State<'_, App>, request: Request<'_>) -> Res<usize> {
     Ok(out.as_ref().map_or(0, |s| s.send_frame(frame, keyframe)))
 }
 
+// ---- updates from GitHub releases ----
+
+/// An update found by `check_update`, kept until the user installs it.
+#[derive(Default)]
+struct PendingUpdate(Mutex<Option<tauri_plugin_updater::Update>>);
+
+#[derive(Serialize)]
+struct UpdateInfo {
+    version: String,
+    current: String,
+    notes: Option<String>,
+}
+
+/// Asks GitHub for a newer signed release.
+#[tauri::command]
+async fn check_update(app: AppHandle, pending: State<'_, PendingUpdate>) -> Res<Option<UpdateInfo>> {
+    let Some(update) = app.updater().map_err(err)?.check().await.map_err(err)? else {
+        return Ok(None);
+    };
+    let info = UpdateInfo { version: update.version.clone(), current: update.current_version.clone(), notes: update.body.clone() };
+    *pending.0.lock().unwrap() = Some(update);
+    Ok(Some(info))
+}
+
+/// Downloads the update, verifies its signature, installs it, and restarts.
+#[tauri::command]
+async fn install_update(app: AppHandle, pending: State<'_, PendingUpdate>) -> Res<()> {
+    let update = pending.0.lock().unwrap().take().ok_or("no update to install")?;
+    update.download_and_install(|_, _| {}, || {}).await.map_err(err)?;
+    app.restart()
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(PendingUpdate::default())
         .setup(|app| {
             // HEARTH_DATA_DIR lets you run several identities side by side.
             let data_dir = match std::env::var_os("HEARTH_DATA_DIR") {
@@ -414,6 +449,8 @@ fn main() {
             watch,
             video_channel,
             push_video,
+            check_update,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running hearth");
