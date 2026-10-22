@@ -121,6 +121,14 @@ class Chrome:
         self.proc.wait()
 
 
+def page_state(chrome, session):
+    expr = "JSON.stringify({url: location.href, ready: document.readyState, tauriMock: typeof window.__TAURI__, header: document.querySelector('#server-header')?.textContent || '', errors: window.__errors || []})"
+    try:
+        return chrome.send("Runtime.evaluate", {"expression": expr, "returnByValue": True}, session).get("result", {}).get("value")
+    except Exception as e:
+        return f"unavailable ({e})"
+
+
 def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=UI))
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -139,9 +147,16 @@ def main():
             sys.exit("Chrome never opened the test page")
         session = chrome.send("Target.attachToTarget", {"targetId": target, "flatten": True})["sessionId"]
         chrome.send("Emulation.setFocusEmulationEnabled", {"enabled": True}, session)
-        deadline = time.time() + 240
+        started = time.time()
+        deadline = started + 240
+        reloaded = False
         results = None
         while time.time() < deadline:
+            if not progress and not reloaded and time.time() - started > 30:
+                # Never booted (seen once on CI): note why, then try a fresh load.
+                print("page hasn't booted after 30 s:", page_state(chrome, session), flush=True)
+                chrome.send("Page.reload", {"ignoreCache": True}, session)
+                reloaded = True
             expr = "JSON.stringify([document.body && document.body.dataset.results || '', document.body && document.body.dataset.progress || ''])"
             r = chrome.send("Runtime.evaluate", {"expression": expr, "returnByValue": True}, session)
             value, progress = json.loads(r.get("result", {}).get("value") or '["", ""]')
@@ -149,11 +164,13 @@ def main():
                 results = json.loads(value)
                 break
             time.sleep(0.5)
+        state_at_end = page_state(chrome, session) if results is None else ""
     finally:
         chrome.close()
         server.shutdown()
 
     if results is None:
+        print("page state:", state_at_end)
         sys.exit(f"UI tests produced no results within 4 minutes; last progress: {progress or 'none (page never booted)'}")
     failed = [r for r in results if not r["ok"]]
     for r in results:

@@ -4,6 +4,7 @@
 const results = [];
 const calls = [];
 const errors = [];
+window.__errors = errors; // for the runner's diagnostics
 window.addEventListener("error", (e) => errors.push(String(e.message)));
 document.addEventListener("securitypolicyviolation", (e) => errors.push(`CSP blocked ${e.blockedURI} (${e.violatedDirective})`));
 window.addEventListener("unhandledrejection", (e) => errors.push("unhandled rejection: " + String(e.reason)));
